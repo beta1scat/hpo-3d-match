@@ -4,6 +4,8 @@ Loads scene point clouds from ITODD TIF depth images (X, Y, Z channels),
 applies ROI pose transform and bounding box crop per Section 2.3 of the paper.
 """
 
+import sys
+
 import halcon as ha
 import numpy as np
 from kinematics import transXYZ, rotX, rotY, rotZ
@@ -70,19 +72,38 @@ def filter_scene_roi(scene_3d, roi_pose_inv, roi: ROIConfig):
     Returns:
         HALCON HObjectModel3D of the cropped scene
     """
-    scene_transformed = ha.rigid_trans_object_model_3d(scene_3d, roi_pose_inv)
-
-    scene_x = ha.select_points_object_model_3d(
-        scene_transformed, ["point_coord_x"], roi.x_range[0], roi.x_range[1]
-    )
-    scene_y = ha.select_points_object_model_3d(
-        scene_x, ["point_coord_y"], roi.y_range[0], roi.y_range[1]
-    )
-    scene_roi = ha.select_points_object_model_3d(
-        scene_y, ["point_coord_z"], roi.z_range[0], roi.z_range[1]
-    )
-
-    return scene_roi
+    scene_transformed = scene_x = scene_y = scene_roi = result = None
+    try:
+        scene_transformed = ha.rigid_trans_object_model_3d(scene_3d, roi_pose_inv)
+        scene_x = ha.select_points_object_model_3d(
+            scene_transformed, ["point_coord_x"], roi.x_range[0], roi.x_range[1]
+        )
+        scene_y = ha.select_points_object_model_3d(
+            scene_x, ["point_coord_y"], roi.y_range[0], roi.y_range[1]
+        )
+        scene_roi = ha.select_points_object_model_3d(
+            scene_y, ["point_coord_z"], roi.z_range[0], roi.z_range[1]
+        )
+        result = scene_roi
+        scene_roi = None
+        return result
+    finally:
+        active_exception = sys.exc_info()[0] is not None
+        cleanup_error = None
+        for handle in (scene_roi, scene_y, scene_x, scene_transformed):
+            if handle is not None:
+                try:
+                    ha.clear_object_model_3d(handle)
+                except ha.HOperatorError as exc:
+                    if cleanup_error is None:
+                        cleanup_error = exc
+        if cleanup_error is not None and not active_exception:
+            if result is not None:
+                try:
+                    ha.clear_object_model_3d(result)
+                except ha.HOperatorError:
+                    pass
+            raise cleanup_error
 
 
 def load_model(model_path: str):
@@ -94,6 +115,23 @@ def load_model(model_path: str):
     Returns:
         model_3d: HALCON HObjectModel3D with surface normals
     """
-    model_3d_raw, _ = ha.read_object_model_3d(model_path, "m", [], [])
-    model_3d = ha.surface_normals_object_model_3d(model_3d_raw, "mls", [], [])
-    return model_3d
+    model_3d_raw = model_3d = None
+    try:
+        model_3d_raw, _ = ha.read_object_model_3d(model_path, "m", [], [])
+        model_3d = ha.surface_normals_object_model_3d(
+            model_3d_raw, "mls", [], []
+        )
+        return model_3d
+    finally:
+        if model_3d_raw is not None:
+            active_exception = sys.exc_info()[0] is not None
+            try:
+                ha.clear_object_model_3d(model_3d_raw)
+            except ha.HOperatorError:
+                if not active_exception:
+                    if model_3d is not None:
+                        try:
+                            ha.clear_object_model_3d(model_3d)
+                        except ha.HOperatorError:
+                            pass
+                    raise

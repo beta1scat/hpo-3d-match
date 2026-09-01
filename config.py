@@ -13,32 +13,33 @@ from typing import Dict, Optional, Tuple
 from pathlib import Path
 
 
+# Supported Optuna Samplers and Pruners (3 Core Samplers: Bayesian, Evolutionary, Random)
+SAMPLER_NAMES = ("TPE", "CmaEs", "Random")
+PRUNER_NAMES = ("Nop", "Median", "Hyperband")
+
 # ---------------------------------------------------------------------------
-# Search space definition (Table 2 in paper)
+# Search space definition (Continuous float + discrete int/categorical, 9 core dimensions)
 # ---------------------------------------------------------------------------
 SEARCH_SPACE = {
-    "RelSamplingDistance": {"type": "float", "low": 0.03, "high": 0.1, "step": 0.01},
-    "KeyPointFraction": {"type": "float", "low": 0.05, "high": 0.3, "step": 0.01},
-    "max_overlap_dist_rel": {"type": "float", "low": 0.1, "high": 1.0, "step": 0.1},
-    "pose_ref_num_steps": {"type": "int", "low": 1, "high": 20, "step": 1},
-    "pose_ref_sub_sampling": {"type": "int", "low": 1, "high": 10, "step": 1},
-    "pose_ref_dist_threshold_rel": {
-        "type": "float",
-        "low": 0.03,
-        "high": 0.2,
-        "step": 0.01,
-    },
-    "pose_ref_scoring_dist_rel": {
-        "type": "categorical",
-        "choices": [0.2, 0.01, 0.005, 0.0001],
-    },
+    # 1. 空间采样连续控制
+    "RelSamplingDistance": {"type": "float", "low": 0.010, "high": 0.20},
+    "KeyPointFraction": {"type": "float", "low": 0.010, "high": 0.60},
+    "min_score": {"type": "float", "low": 0.0, "high": 0.70},
+    "max_overlap_dist_rel": {"type": "float", "low": 0.05, "high": 1.00},
+
+    # 2. ICP 姿态精修与评分控制 (Continuous / Discrete Physical Controls)
+    "pose_ref_num_steps": {"type": "int", "low": 1, "high": 50, "step": 1},
+    "pose_ref_sub_sampling": {"type": "int", "low": 1, "high": 25, "step": 1},
+    "pose_ref_dist_threshold_rel": {"type": "float", "low": 0.005, "high": 0.50},
+    "pose_ref_scoring_dist_rel": {"type": "float", "low": 0.0001, "high": 0.25},
     "pose_ref_use_scene_normals": {"type": "categorical", "choices": ["true", "false"]},
 }
 
-# Default parameter values from HALCON documentation
+# Default parameter values strictly matching HALCON official documentation
 DEFAULT_PARAMS = {
     "RelSamplingDistance": 0.05,
     "KeyPointFraction": 0.2,
+    "min_score": 0.0,
     "max_overlap_dist_rel": 0.5,
     "pose_ref_num_steps": 5,
     "pose_ref_sub_sampling": 2,
@@ -110,17 +111,19 @@ MODEL_CONFIGS: Dict[str, ModelConfig] = {
 }
 
 
-# ---------------------------------------------------------------------------
-# Sampler and pruner combinations (Section 3 / Algorithm 1)
-# ---------------------------------------------------------------------------
-SAMPLER_NAMES = ["TPE", "CmaEs", "NSGAII", "QMC", "Random"]
-PRUNER_NAMES = ["Median", "Nop", "Hyperband"]
+
 
 
 MODEL_FILE_NAMES = {
     "star": "star.ply",
     "screw_black": "screw.ply",
     "bracket_planar": "bracket_planar.ply",
+}
+
+TARGET_OBJECT_IDS = {
+    "screw_black": 24,
+    "star": 25,
+    "bracket_planar": 5,
 }
 
 

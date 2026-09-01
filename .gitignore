@@ -2,8 +2,6 @@
 __pycache__/
 *.py[cod]
 
-.python-version
-
 results/
 *.db
 *.sqlite
@@ -20,3 +18,7 @@ data/scene_gt_*.json
 
 .DS_Store
 Thumbs.db
+
+data/
+results_bak/
+visualizations/

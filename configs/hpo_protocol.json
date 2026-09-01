@@ -1,0 +1,77 @@
+{
+  "schema": "hpo-3d-match/multi-object-hpo",
+  "version": 1,
+  "status": "approved_active",
+  "protocol_id": "hpo-3d-match-multi-object-matrix-v1",
+  "decision_authority": "research_lead",
+  "decision_date": "2026-08-28",
+  "targets": {
+    "screw_black": 24,
+    "star": 25,
+    "bracket_planar": 5
+  },
+  "objective": {
+    "version": "lexicographical-recall-first",
+    "num_matches": 10,
+    "translation_threshold_mm_inclusive": 10.0,
+    "rotation_threshold_deg_inclusive": 10.0,
+    "symmetry": "official BOP per-query"
+  },
+  "manifest": {
+    "path": "data/manifests/itodd_scene0_v1/bop_manifest.csv",
+    "sha256": "1f408c68671814c8b20719af7dbf8d8f081080092d6765fc487e0748a6a1e5b8"
+  },
+  "split": {
+    "path": "data/manifests/itodd_scene0_v1/bop_split.json",
+    "sha256": "eaa8f115a705230d7b86da28bca98edb0802396e13ebd26958ba3849b5d8cfc4"
+  },
+  "matrix": {
+    "sampler": "TPE",
+    "pruner": "Nop",
+    "seed": 42,
+    "repeat": 0,
+    "n_jobs": 1,
+    "trials": 100,
+    "checkpoints": [
+      25,
+      50,
+      75,
+      100
+    ]
+  },
+  "resource_limits": {
+    "optimization_wall_limit_sec": 5184000,
+    "dev_wall_pool_sec": 21600,
+    "pilot_queries": 32,
+    "pilot_private_memory_limit_bytes": 27917287424
+  },
+  "success_criterion": {
+    "conditions": [
+      "checkpoint TP > 0",
+      "checkpoint F1 > DEFAULT_PARAMS F1",
+      "checkpoint objective < empty-prediction baseline"
+    ],
+    "reported_decision": "earliest checkpoint satisfying all conditions",
+    "parameter_freeze_on_success": true
+  },
+  "final_evaluation": {
+    "dataset": "itoddmv_val",
+    "role": "single post-freeze evaluation",
+    "part_of_hpo": false,
+    "reoptimization_allowed": false
+  },
+  "isolation": {
+    "train_scenes": [
+      0
+    ],
+    "dev_scenes": [
+      0
+    ],
+    "test_scenes": [],
+    "allowed_splits_during_hpo": [
+      "train",
+      "dev"
+    ],
+    "default_results_root": "results/hpo-experiments-v1"
+  }
+}

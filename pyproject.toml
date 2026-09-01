@@ -3,13 +3,16 @@ name = "hpo-3d-match"
 version = "0.1.0"
 description = "A Parameters Optimization Framework for Pose Estimation Algorithm Based on Point Cloud"
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.10,<3.11"
 dependencies = [
-    "optuna>=3.0",
-    "numpy",
-    "spatialmath-python",
+    "cmaes>=0.10.0",
+    "imageio>=2.31",
+    "matplotlib",
     "mvtec-halcon==24111",
+    "numpy<2",
+    "optuna>=3.0",
+    "scipy",
 ]
 
-[project.scripts]
-hpo-3d-match = "main:main"
+[tool.uv]
+package = false
