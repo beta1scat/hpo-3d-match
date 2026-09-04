@@ -19,6 +19,13 @@ def compute_roi_transform(roi: ROIConfig):
         roi_mat:     4x4 numpy array, ROI pose in camera frame
         roi_pose_inv: HALCON pose (inverted), used to transform scene into ROI frame
     """
+    if hasattr(roi, "matrix") and roi.matrix is not None:
+        roi_mat = np.array(roi.matrix, dtype=np.float64)
+        hom_mat = roi_mat[:3, :].flatten().tolist()
+        hom_mat_inv = ha.hom_mat3d_invert(hom_mat)
+        roi_pose_inv = ha.hom_mat3d_to_pose(hom_mat_inv)
+        return roi_mat, roi_pose_inv
+
     translation = transXYZ(roi.tx, roi.ty, roi.tz)
     rotation = rotX(roi.rx).dot(rotY(roi.ry)).dot(rotZ(roi.rz))
     roi_mat = translation.dot(rotation)

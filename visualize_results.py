@@ -227,6 +227,7 @@ def visualize_bop_scene(
     image_id: int,
     params: dict[str, Any],
     out_dir: Path,
+    show_full_scene: bool = False,
 ) -> None:
     """Run matching and visualization on a BOP dataset scene (e.g. itoddmv_val)."""
     print(f"\n==================== [BOP Scene] Model: {model_name} | Scene: {scene_id} | Image: {image_id} ====================")
@@ -266,8 +267,25 @@ def visualize_bop_scene(
     if np.asarray(cad_mesh.vertices).max() > 10.0:  # If in mm, convert to metres
         cad_mesh.scale(0.001, center=(0, 0, 0))
 
-    # Match using HALCON
-    halcon_scene = create_halcon_point_cloud(points_xyz_m)
+    # 3D ROI Box Filter (strip tabletop and background points in camera frame)
+    roi = ROIConfig()
+    roi_mat = np.array(roi.matrix, dtype=np.float64)
+    inv_roi_mat = np.linalg.inv(roi_mat)
+    pts_h = np.column_stack([points_xyz_m, np.ones(len(points_xyz_m))])
+    pts_roi = (inv_roi_mat @ pts_h.T).T[:, :3]
+    z_min, z_max = roi.get_z_range(is_bop=True)
+    in_roi = (
+        (pts_roi[:, 0] >= roi.x_range[0])
+        & (pts_roi[:, 0] <= roi.x_range[1])
+        & (pts_roi[:, 1] >= roi.y_range[0])
+        & (pts_roi[:, 1] <= roi.y_range[1])
+        & (pts_roi[:, 2] >= z_min)
+        & (pts_roi[:, 2] <= z_max)
+    )
+
+    # Match using HALCON on ROI-filtered points (or full scene if requested)
+    match_pts = points_xyz_m if show_full_scene else points_xyz_m[in_roi]
+    halcon_scene = create_halcon_point_cloud(match_pts)
     halcon_model = _load_model(cad_path, "mm")
     config = surface_matching_config(params, timeout_sec=5.0, min_score=0.01, num_matches=10)
 
@@ -286,7 +304,9 @@ def visualize_bop_scene(
     # Render 2D & 3D
     prefix = f"bop_{model_name}_s{scene_id}_im{image_id}"
     render_2d_overlay(img_2d, cad_mesh, poses_4x4, camera.intrinsic_matrix, out_dir / f"{prefix}_2d_overlay.png", match_res.scores)
-    render_3d_pointcloud(points_xyz_m, cad_mesh, poses_4x4, out_dir / f"{prefix}_3d_pointcloud.png", scene_colors=point_colors)
+    render_pts = points_xyz_m if show_full_scene else points_xyz_m[in_roi]
+    render_colors = point_colors if show_full_scene else point_colors[in_roi]
+    render_3d_pointcloud(render_pts, cad_mesh, poses_4x4, out_dir / f"{prefix}_3d_pointcloud.png", scene_colors=render_colors)
 
     # Save metadata JSON
     meta = {
@@ -310,6 +330,7 @@ def visualize_native_scene(
     scene_id: int,
     params: dict[str, Any],
     out_dir: Path,
+    show_full_scene: bool = False,
 ) -> None:
     """Run matching and visualization on an ITODD Native scene (data/3d_long_baseline)."""
     print(f"\n==================== [ITODD Native Scene] Model: {model_name} | Scene: {scene_id} ====================")
@@ -371,9 +392,21 @@ def visualize_native_scene(
     # Approximate default camera K for ITODD sensor
     cam_k = np.array([[2900.0, 0.0, img_2d.shape[1] / 2.0], [0.0, 2900.0, img_2d.shape[0] / 2.0], [0.0, 0.0, 1.0]])
 
+    # Filter 3D points by ROI for 3D visualization
+    inv_roi_mat = np.linalg.inv(roi_mat)
+    pts_h = np.column_stack([points_xyz_m, np.ones(len(points_xyz_m))])
+    pts_roi = (inv_roi_mat @ pts_h.T).T[:, :3]
+    in_roi = (
+        (pts_roi[:, 0] >= roi.x_range[0]) & (pts_roi[:, 0] <= roi.x_range[1]) &
+        (pts_roi[:, 1] >= roi.y_range[0]) & (pts_roi[:, 1] <= roi.y_range[1]) &
+        (pts_roi[:, 2] >= roi.z_range[0]) & (pts_roi[:, 2] <= roi.z_range[1])
+    )
+    render_pts = points_xyz_m if show_full_scene else points_xyz_m[in_roi]
+    render_colors = point_colors if show_full_scene else point_colors[in_roi]
+
     prefix = f"native_{model_name}_scene{scene_id:04d}"
     render_2d_overlay(img_2d, cad_mesh, poses_4x4, cam_k, out_dir / f"{prefix}_2d_overlay.png", match_res.scores)
-    render_3d_pointcloud(points_xyz_m, cad_mesh, poses_4x4, out_dir / f"{prefix}_3d_pointcloud.png", scene_colors=point_colors)
+    render_3d_pointcloud(render_pts, cad_mesh, poses_4x4, out_dir / f"{prefix}_3d_pointcloud.png", scene_colors=render_colors)
 
     meta = {
         "dataset": "itodd_native_3d_long_baseline",
@@ -389,24 +422,52 @@ def visualize_native_scene(
     print(f"[+] Saved metadata to {out_dir / f'{prefix}_meta.json'}")
 
 
+def load_scene_ids_from_file(file_path: Path) -> list[int]:
+    """Parse scene IDs from a scene list file, ignoring comments and empty lines."""
+    scene_ids = []
+    with open(file_path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            try:
+                scene_ids.append(int(line))
+            except ValueError:
+                continue
+    return scene_ids
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Visualize surface matching on BOP or ITODD Native scenes.")
     parser.add_argument("--model", required=True, choices=["bracket_planar", "screw_black", "star"])
     parser.add_argument("--dataset-type", choices=["bop", "native"], default="native", help="Dataset format: bop or native")
     parser.add_argument("--storage-dir", type=Path, help="Directory containing study .db to extract optimal parameters")
-    parser.add_argument("--scenes", type=str, default="0,1,2,3,4", help="Comma-separated scene IDs to visualize")
+    parser.add_argument("--scene-list", type=Path, help="Path to scene list text file (default: data/base_package/models/scene_lists/scene_list_<model>.txt)")
+    parser.add_argument("--scenes", type=str, help="Explicit comma-separated scene IDs to visualize (overrides --scene-list)")
+    parser.add_argument("--max-scenes", type=int, default=5, help="Max scenes to process from list (default: 5, set <=0 for all)")
+    parser.add_argument("--show-full-scene", action="store_true", help="Render uncropped full scene point cloud instead of cropped ROI")
     parser.add_argument("--out-dir", type=Path, default=Path("visualizations/results"))
     args = parser.parse_args()
 
     args.out_dir.mkdir(parents=True, exist_ok=True)
     params = get_best_params_from_study(args.storage_dir, args.model) if args.storage_dir else dict(DEFAULT_PARAMS)
 
-    scene_ids = [int(s.strip()) for s in args.scenes.split(",") if s.strip()]
-
     if args.dataset_type == "native":
+        if args.scenes:
+            scene_ids = [int(s.strip()) for s in args.scenes.split(",") if s.strip()]
+        else:
+            list_file = args.scene_list or (Path("data/base_package/models/scene_lists") / f"scene_list_{args.model}.txt")
+            if not list_file.exists():
+                raise FileNotFoundError(f"Scene list file not found: {list_file}")
+            print(f"[+] Loading native scenes from: {list_file}")
+            scene_ids = load_scene_ids_from_file(list_file)
+            if args.max_scenes > 0:
+                scene_ids = scene_ids[:args.max_scenes]
+
+        print(f"[*] Processing {len(scene_ids)} native scenes: {scene_ids}")
         for scene_id in scene_ids:
             try:
-                visualize_native_scene(args.model, scene_id, params, args.out_dir)
+                visualize_native_scene(args.model, scene_id, params, args.out_dir, show_full_scene=args.show_full_scene)
             except Exception as e:
                 print(f"[!] Error processing native scene {scene_id}: {e}")
     else:
@@ -417,7 +478,15 @@ def main() -> int:
         selected_ims = im_ids.get(args.model, [0])
         for im_id in selected_ims:
             try:
-                visualize_bop_scene(args.model, manifest, scene_id=1, image_id=im_id, params=params, out_dir=args.out_dir)
+                visualize_bop_scene(
+                    args.model,
+                    manifest,
+                    scene_id=1,
+                    image_id=im_id,
+                    params=params,
+                    out_dir=args.out_dir,
+                    show_full_scene=args.show_full_scene,
+                )
             except Exception as e:
                 print(f"[!] Error processing BOP scene: {e}")
 

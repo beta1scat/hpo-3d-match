@@ -19,9 +19,9 @@ def main():
         print(f"No experiment_summary.json files found under {results_dir}/")
         return
 
-    print("=" * 155)
-    print(f"{'Experiment Directory / Model':<36} | {'Sampler':<8} | {'Pruner':<8} | {'Objective':<10} | {'Budget':<6} | {'Base F1':<8} | {'Final F1':<8} | {'TP/FP/FN':<10} | {'Final Loss':<10} | {'Peak Dev Result'}")
-    print("=" * 155)
+    print("=" * 168)
+    print(f"{'Experiment Directory / Model':<48} | {'Sampler':<8} | {'Pruner':<8} | {'Objective':<10} | {'Budget':<6} | {'Base F1':<8} | {'Final F1':<8} | {'TP/FP/FN':<10} | {'Final Loss':<10} | {'Peak Dev Result'}")
+    print("=" * 168)
     for p in summary_files:
         try:
             d = json.loads(p.read_text(encoding="utf-8"))
@@ -45,10 +45,10 @@ def main():
             obj_ver = d.get("objective_version", "")
             obj_tag = "lexrecall" if ("recall" in obj_ver or "lex" in obj_ver) else "fixedpen"
             budget = d.get("budget", len(checkpoints))
-            print(f"{exp_name:<36} | {sampler:<8} | {pruner:<8} | {obj_tag:<10} | {budget:<6} | {base_f1:<8.4f} | {final_f1:<8.4f} | {final_counts:<10} | {final_loss:<10.2f} | {peak_info}")
+            print(f"{exp_name:<48} | {sampler:<8} | {pruner:<8} | {obj_tag:<10} | {budget:<6} | {base_f1:<8.4f} | {final_f1:<8.4f} | {final_counts:<10} | {final_loss:<10.2f} | {peak_info}")
         except Exception as e:
             print(f"Error reading {p}: {e}")
-    print("=" * 145)
+    print("=" * 168)
 
 
 if __name__ == "__main__":

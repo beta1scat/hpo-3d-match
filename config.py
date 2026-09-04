@@ -56,17 +56,35 @@ DEFAULT_PARAMS = {
 class ROIConfig:
     """Region of Interest box and transform for scene filtering."""
 
+    # 4x4 Homogeneous Transformation Matrix in camera frame
+    matrix: Tuple[Tuple[float, ...], ...] = (
+        (0.992133677006, 0.000235779997, -0.125182598829, -0.000276237726),
+        (0.000015320000, 0.999998569489, 0.002004910028, 0.002120137215),
+        (0.125182747841, -0.001991060097, 0.992132246494, 0.709632635117),
+        (0.000000000000, 0.000000000000, 0.000000000000, 1.000000000000),
+    )
+
     # ROI pose (translation in meters, rotation in degrees)
-    tx: float = 0.009090036154
-    ty: float = -0.003862455487
-    tz: float = 0.704267919064
-    rx: float = 0.0
-    ry: float = -7.2081212
-    rz: float = -7.8092508
-    # Bounding box half-extents (meters)
-    x_range: Tuple[float, float] = (-0.22216535 / 2, 0.22216535 / 2)
-    y_range: Tuple[float, float] = (-0.22267956 / 2, 0.22267956 / 2)
-    z_range: Tuple[float, float] = (-0.078 / 2, 0.078 / 2)
+    tx: float = -0.000276237726
+    ty: float = 0.002120137215
+    tz: float = 0.709632635117
+    rx: float = -0.115783684
+    ry: float = -7.191300854
+    rz: float = -0.013616309
+
+    # Bounding box half-extents (meters): Dx=0.378, Dy=0.378, Dz=0.07285595
+    # Native table sits at Z ≈ 0.0335~0.0345m (clamped to +0.0326m)
+    # BOP depth backprojection has +3.4mm shift, table sits at Z ≈ 0.0366~0.0378m (clamped to +0.0360m)
+    x_range: Tuple[float, float] = (-0.378 / 2, 0.378 / 2)
+    y_range: Tuple[float, float] = (-0.378 / 2, 0.378 / 2)
+    z_min: float = -0.07285595 / 2
+    z_max_native: float = 0.0326
+    z_max_bop: float = 0.0360
+    z_range: Tuple[float, float] = (-0.07285595 / 2, 0.0326)
+
+    def get_z_range(self, is_bop: bool = False) -> Tuple[float, float]:
+        """Return (z_min, z_max) calibrated for either Native or BOP point clouds."""
+        return (self.z_min, self.z_max_bop if is_bop else self.z_max_native)
 
 
 # ---------------------------------------------------------------------------

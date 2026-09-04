@@ -140,18 +140,26 @@ def run_single_experiment(
     objective_version: str = LEXICOGRAPHICAL_RECALL_FIRST,
     results_root: Path | None = None,
     manifest_path: Path | None = None,
+    allow_query_overlap: bool = False,
     resume: bool = False,
+    use_roi: bool | None = None,
 ) -> dict[str, Any]:
     """Run full HPO optimization lifecycle for a specified configuration."""
     manifest = manifest_path or (ROOT / "data" / "manifests" / "itodd_scene0_v1" / "bop_manifest.csv")
+    if use_roi is None:
+        use_roi = "itoddmv_val" in str(manifest)
+    if use_roi:
+        print(f"[*] 3D ROI scene preprocessing enabled for {manifest.name}")
+
     obj_tag = "lexrecall" if ("recall" in objective_version or "lex" in objective_version) else "fixedpen"
     exp_dir_name = f"{model}_{sampler.lower()}_{pruner.lower()}_{obj_tag}_b{budget}_s{seed}"
     out_root = results_root or (ROOT / "results" / exp_dir_name)
-    step = 25 if budget <= 100 else 50
-    ckpt_list = list(checkpoints or range(step, budget + 1, step))
-    if not ckpt_list or ckpt_list[-1] != budget:
-        if budget not in ckpt_list:
+    if checkpoints:
+        ckpt_list = list(checkpoints)
+        if ckpt_list[-1] != budget:
             ckpt_list.append(budget)
+    else:
+        ckpt_list = sorted({max(1, round(budget * i / 10)) for i in range(1, 11)})
 
     studies_dir = out_root / "studies"
     evals_dir = out_root / "evaluations"
@@ -165,6 +173,8 @@ def run_single_experiment(
         "--model", model,
         "--objective-version", objective_version,
     ]
+    if use_roi:
+        common_opts += ["--use-roi"]
     if config_path and config_path.exists():
         common_opts += ["--protocol-record", str(config_path)]
 
@@ -227,6 +237,8 @@ def run_single_experiment(
                 "--repeat", str(repeat),
                 "--seed", str(seed),
             ]
+            if allow_query_overlap:
+                eval_cmd.append("--allow-query-overlap")
             run_phase_subprocess(eval_cmd, logs_dir / f"eval_ckpt_{ckpt}.log", f"Checkpoint {ckpt} Evaluation")
         
         res = read_json_dict(ckpt_manifest)["result"]
@@ -242,13 +254,14 @@ def run_single_experiment(
         print(f"[*] Checkpoint {ckpt:4d}: TP={res['tp']:2d}, FP={res['fp']:3d}, FN={res['fn']:2d}, F1={res['f1']:.4f}, Loss={res['objective']:.2f}")
 
     summary = {
-        "experiment_name": exp_dir_name,
+        "experiment_name": out_root.name,
         "model": model,
         "sampler": sampler,
         "pruner": pruner,
         "objective_version": objective_version,
         "budget": budget,
         "seed": seed,
+        "use_roi": use_roi,
         "default_baseline": default_result,
         "checkpoints": checkpoint_results,
     }
@@ -283,6 +296,17 @@ def main() -> int:
     parser.add_argument("--repeat", type=int, default=0)
     parser.add_argument("--results-root", type=Path)
     parser.add_argument("--manifest", type=Path)
+    parser.add_argument(
+        "--allow-query-overlap",
+        action="store_true",
+        help="Explicitly allow evaluation queries to overlap study queries (manual opt-in for Oracle experiments)",
+    )
+    parser.add_argument(
+        "--use-roi",
+        action="store_true",
+        default=None,
+        help="Explicitly enable 3D ROI bounding box cropping (auto-enabled for itoddmv_val)",
+    )
     parser.add_argument("--resume", action="store_true")
     parser.add_argument(
         "--matrix",
@@ -308,7 +332,9 @@ def main() -> int:
                 repeat=args.repeat,
                 objective_version=args.objective_version,
                 manifest_path=args.manifest,
+                allow_query_overlap=args.allow_query_overlap,
                 resume=args.resume,
+                use_roi=args.use_roi,
             )
         return 0
 
@@ -324,7 +350,9 @@ def main() -> int:
         objective_version=args.objective_version,
         results_root=args.results_root,
         manifest_path=args.manifest,
+        allow_query_overlap=args.allow_query_overlap,
         resume=args.resume,
+        use_roi=args.use_roi,
     )
     return 0
 

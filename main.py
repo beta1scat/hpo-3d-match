@@ -117,6 +117,11 @@ def _add_bop_arguments(
         default=None,
         help="2D isotropic grid downsampling stride (default: 3)",
     )
+    parser.add_argument(
+        "--use-roi",
+        action="store_true",
+        help="apply 3D ROI bounding box cropping to strip table and background",
+    )
     _add_run_arguments(parser)
 
 
@@ -224,6 +229,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--trial-limit",
         type=_positive_int,
         help="evaluate the best COMPLETE trial among trial numbers below this limit",
+    )
+    evaluate_best.add_argument(
+        "--allow-query-overlap",
+        action="store_true",
+        help="allow evaluation queries to overlap study queries (e.g. for Oracle or train upper-bound evaluation)",
     )
 
     external = subparsers.add_parser(
@@ -473,6 +483,8 @@ def _load_pipeline(args: argparse.Namespace) -> Any:
         kwargs["depth_range_m"] = args.depth_range_m
     if getattr(args, "depth_stride", None) is not None:
         kwargs["depth_stride"] = args.depth_stride
+    if getattr(args, "use_roi", False):
+        kwargs["use_roi"] = True
 
     return BOPPipeline(args.bop_manifest, args.model, args.split, **kwargs)
 
@@ -1124,7 +1136,8 @@ def _run_evaluate_best(args: argparse.Namespace) -> int:
     from pipeline import read_bop_queries
 
     target_queries = read_bop_queries(args.bop_manifest, args.model, args.split)
-    _validate_no_query_overlap(source_queries, target_queries)
+    if not getattr(args, "allow_query_overlap", False):
+        _validate_no_query_overlap(source_queries, target_queries)
     identity = _study_attrs(
         study,
         ("repeat", "seed", "split", "budget", "database_terminal_trials"),

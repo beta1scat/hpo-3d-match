@@ -369,6 +369,49 @@ def backproject_depth(
     return points[np.all(np.isfinite(points), axis=1)]
 
 
+def filter_points_roi(
+    points_xyz_m: np.ndarray,
+    roi: Any = None,
+    *,
+    is_bop: bool = True,
+) -> np.ndarray:
+    """Filter camera-frame 3D points by ROI bounding box, retaining camera coordinates."""
+    if len(points_xyz_m) == 0:
+        return points_xyz_m
+
+    if roi is None:
+        from config import ROIConfig
+
+        roi = ROIConfig()
+
+    roi_mat = (
+        np.array(roi.matrix, dtype=np.float64)
+        if hasattr(roi, "matrix") and roi.matrix is not None
+        else None
+    )
+    if roi_mat is None:
+        return points_xyz_m
+
+    inv_roi_mat = np.linalg.inv(roi_mat)
+    pts_h = np.column_stack([points_xyz_m, np.ones(len(points_xyz_m))])
+    pts_roi = (inv_roi_mat @ pts_h.T).T[:, :3]
+
+    if hasattr(roi, "get_z_range"):
+        z_min, z_max = roi.get_z_range(is_bop=is_bop)
+    else:
+        z_min, z_max = roi.z_range
+
+    in_roi = (
+        (pts_roi[:, 0] >= roi.x_range[0])
+        & (pts_roi[:, 0] <= roi.x_range[1])
+        & (pts_roi[:, 1] >= roi.y_range[0])
+        & (pts_roi[:, 1] <= roi.y_range[1])
+        & (pts_roi[:, 2] >= z_min)
+        & (pts_roi[:, 2] <= z_max)
+    )
+    return points_xyz_m[in_roi]
+
+
 def load_bop_scene_data(
     scene_gt_path: str | Path,
     scene_gt_info_path: str | Path,
@@ -380,6 +423,8 @@ def load_bop_scene_data(
     min_visib_fract: float = DEFAULT_MIN_VISIB_FRACT,
     depth_range_m: Sequence[float] | None = None,
     stride: int = 1,
+    use_roi: bool = False,
+    roi: Any = None,
 ) -> BOPSceneData:
     """Load a BOP scene query without importing or requiring HALCON."""
 
@@ -398,6 +443,8 @@ def load_bop_scene_data(
         depth_range_m=depth_range_m,
         stride=stride,
     )
+    if use_roi:
+        points = filter_points_roi(points, roi=roi, is_bop=True)
     return BOPSceneData(
         scene_id=scene_id,
         image_id=image_id,
@@ -435,6 +482,8 @@ def load_bop_scene(
     min_visib_fract: float = DEFAULT_MIN_VISIB_FRACT,
     depth_range_m: Sequence[float] | None = None,
     stride: int = 1,
+    use_roi: bool = False,
+    roi: Any = None,
 ) -> tuple[object, list[PoseRecord]]:
     """Return a HALCON scene point cloud and matching BOP GT pose list."""
 
@@ -448,5 +497,9 @@ def load_bop_scene(
         obj_id=obj_id,
         min_visib_fract=min_visib_fract,
         depth_range_m=depth_range_m,
+        stride=stride,
+        use_roi=use_roi,
+        roi=roi,
     )
     return create_halcon_point_cloud(data.points_xyz_m), list(data.ground_truths)
+

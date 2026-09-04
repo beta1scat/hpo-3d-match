@@ -16,11 +16,12 @@ import optuna
 from bop_scene_loader import (
     backproject_depth,
     create_halcon_point_cloud,
+    filter_points_roi,
     read_bop_camera,
     read_bop_ground_truths,
     read_depth_image,
 )
-from config import DEFAULT_PARAMS, SEARCH_SPACE
+from config import DEFAULT_PARAMS, ROIConfig, SEARCH_SPACE
 from dataset import SPLIT_NAMES, TARGET_OBJECT_IDS
 from evaluation import PoseRecord, SymmetryConfig, read_bop_symmetry
 from experiment_io import append_jsonl, generate_run_id
@@ -360,6 +361,8 @@ class BOPPipeline:
         model_scale: str | float = MODEL_SCALE_MM_TO_M,
         depth_range_m: Sequence[float] | None = DEFAULT_DEPTH_RANGE_M,
         depth_stride: int = DEFAULT_DEPTH_STRIDE,
+        use_roi: bool = False,
+        roi: ROIConfig | None = None,
     ) -> None:
         self.manifest_path = Path(manifest_path).expanduser().resolve()
         self.model_name = model_name
@@ -367,6 +370,8 @@ class BOPPipeline:
         self.model_scale = model_scale
         self.depth_range_m = depth_range_m
         self.depth_stride = depth_stride
+        self.use_roi = bool(use_roi)
+        self.roi = roi if roi is not None else ROIConfig()
         self.queries = read_bop_queries(self.manifest_path, model_name, split)
         self.model_point_cloud = None
         self.cached_queries: tuple[CachedBOPQuery, ...] = ()
@@ -410,6 +415,10 @@ class BOPPipeline:
                     depth_range_m=self.depth_range_m,
                     stride=self.depth_stride,
                 )
+                if self.use_roi:
+                    points_xyz_m = filter_points_roi(
+                        points_xyz_m, self.roi, is_bop=True
+                    )
                 pending_scene_handle = create_halcon_point_cloud(points_xyz_m)
                 scene_handles.append(pending_scene_handle)
                 scene_point_cloud = pending_scene_handle
