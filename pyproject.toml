@@ -11,6 +11,7 @@ dependencies = [
     "mvtec-halcon==24111",
     "numpy<2",
     "optuna>=3.0",
+    "scikit-learn>=1.7.2",
     "scipy",
 ]
 

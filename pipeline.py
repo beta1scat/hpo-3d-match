@@ -417,7 +417,7 @@ class BOPPipeline:
                 )
                 if self.use_roi:
                     points_xyz_m = filter_points_roi(
-                        points_xyz_m, self.roi, is_bop=True
+                        points_xyz_m, self.roi
                     )
                 pending_scene_handle = create_halcon_point_cloud(points_xyz_m)
                 scene_handles.append(pending_scene_handle)

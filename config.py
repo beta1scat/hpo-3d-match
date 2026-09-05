@@ -58,33 +58,32 @@ class ROIConfig:
 
     # 4x4 Homogeneous Transformation Matrix in camera frame
     matrix: Tuple[Tuple[float, ...], ...] = (
-        (0.992133677006, 0.000235779997, -0.125182598829, -0.000276237726),
-        (0.000015320000, 0.999998569489, 0.002004910028, 0.002120137215),
-        (0.125182747841, -0.001991060097, 0.992132246494, 0.709632635117),
+        (0.992053687572, 0.000117960000, -0.125815242529, 0.003062009811),
+        (0.000092490001, 0.999998509884, 0.001666859956, -0.000230103731),
+        (0.125815272331, -0.001665250049, 0.992052197456, 0.721286177635),
         (0.000000000000, 0.000000000000, 0.000000000000, 1.000000000000),
     )
 
     # ROI pose (translation in meters, rotation in degrees)
-    tx: float = -0.000276237726
-    ty: float = 0.002120137215
-    tz: float = 0.709632635117
-    rx: float = -0.115783684
-    ry: float = -7.191300854
-    rz: float = -0.013616309
+    tx: float = 0.003062009811
+    ty: float = -0.000230103731
+    tz: float = 0.721286177635
+    rx: float = -0.096269078
+    ry: float = -7.227837405
+    rz: float = -0.006812746
 
-    # Bounding box half-extents (meters): Dx=0.378, Dy=0.378, Dz=0.07285595
-    # Native table sits at Z ≈ 0.0335~0.0345m (clamped to +0.0326m)
-    # BOP depth backprojection has +3.4mm shift, table sits at Z ≈ 0.0366~0.0378m (clamped to +0.0360m)
-    x_range: Tuple[float, float] = (-0.378 / 2, 0.378 / 2)
-    y_range: Tuple[float, float] = (-0.378 / 2, 0.378 / 2)
-    z_min: float = -0.07285595 / 2
-    z_max_native: float = 0.0326
-    z_max_bop: float = 0.0360
-    z_range: Tuple[float, float] = (-0.07285595 / 2, 0.0326)
+    # Bounding box extents (meters): Dx=0.30939281, Dy=0.23774898, Dz=0.08699393
+    # Z range: [-Dz/2, 0.0432] with upper bound clamped to 0.0432m to filter tabletop
+    x_range: Tuple[float, float] = (-0.30939281 / 2, 0.30939281 / 2)
+    y_range: Tuple[float, float] = (-0.23774898 / 2, 0.23774898 / 2)
 
-    def get_z_range(self, is_bop: bool = False) -> Tuple[float, float]:
-        """Return (z_min, z_max) calibrated for either Native or BOP point clouds."""
-        return (self.z_min, self.z_max_bop if is_bop else self.z_max_native)
+    # Native
+    # z_range: Tuple[float, float] = (-0.05, 0.022) # For bracket_planar
+    # z_range: Tuple[float, float] = (-0.05, 0.022) # For star and screw_black
+
+    # BOP
+    z_range: Tuple[float, float] = (-0.05, 0.025) # For bracket_planar
+    # z_range: Tuple[float, float] = (-0.05, 0.022) # For star and screw_black
 
 
 # ---------------------------------------------------------------------------

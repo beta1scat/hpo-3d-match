@@ -18,6 +18,7 @@ import copy
 import json
 import os
 import sys
+import time
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -26,6 +27,7 @@ import halcon as ha
 import imageio.v3 as iio
 import numpy as np
 import open3d as o3d
+from scipy.spatial import cKDTree
 
 from bop_scene_loader import (
     BOPCamera,
@@ -143,6 +145,7 @@ def render_3d_pointcloud(
     poses: list[np.ndarray],
     out_path: Path,
     scene_colors: np.ndarray | None = None,
+    peeled_points_list: list[np.ndarray] | None = None,
 ) -> None:
     """Render 3D point cloud with textured sensor points and CAD models in 3D perspective."""
     pcd = o3d.geometry.PointCloud()
@@ -168,6 +171,22 @@ def render_3d_pointcloud(
         inst_mesh.compute_vertex_normals()  # 3D shading highlights
         inst_mesh.paint_uniform_color(colors[idx % len(colors)])
         vis_geoms.append(inst_mesh)
+
+    # If peeling progression layers are provided, render them with distinct progression colors
+    if peeled_points_list:
+        peel_palette = [
+            [0.95, 0.25, 0.25],  # Layer 1: Coral red
+            [1.00, 0.55, 0.10],  # Layer 2: Vivid orange
+            [0.85, 0.20, 0.80],  # Layer 3: Purple magenta
+            [0.20, 0.80, 0.85],  # Layer 4: Cyan teal
+            [0.90, 0.80, 0.20],  # Layer 5: Gold
+        ]
+        for idx, peeled_pts in enumerate(peeled_points_list):
+            if len(peeled_pts) > 0:
+                p_pcd = o3d.geometry.PointCloud()
+                p_pcd.points = o3d.utility.Vector3dVector(peeled_pts)
+                p_pcd.paint_uniform_color(peel_palette[idx % len(peel_palette)])
+                vis_geoms.append(p_pcd)
 
     vis = o3d.visualization.Visualizer()
     # 4K Ultra-HD resolution buffer
@@ -220,6 +239,208 @@ def render_3d_pointcloud(
     print(f"[+] Saved 4K Ultra-HD 3D point cloud visualization to {out_path}")
 
 
+def sequential_subtraction_matching(
+    model_point_cloud_halcon: Any,
+    cad_mesh_o3d: o3d.geometry.TriangleMesh,
+    initial_scene_points_xyz_m: np.ndarray,
+    matching_params: dict[str, Any],
+    min_score: float = 0.50,
+    subtraction_radius: float = 0.005,
+    max_iterations: int = 10,
+    roi_transform_mat: np.ndarray | None = None,
+    interactive: bool = False,
+) -> tuple[list[np.ndarray], list[float], list[dict[str, Any]], list[np.ndarray]]:
+    """Execute recursive single-instance matching and spatial point subtraction (Route A).
+
+    Args:
+        model_point_cloud_halcon: HALCON surface model handle or 3D object model
+        cad_mesh_o3d: Open3D CAD mesh in metres
+        initial_scene_points_xyz_m: Initial camera-space scene point cloud in metres
+        matching_params: PPF/ICP hyperparameters
+        min_score: Minimum matching and convergence threshold; stops when best match score < min_score
+        subtraction_radius: Distance threshold (metres) to peel away points around matched CAD
+        max_iterations: Safety ceiling on iterations
+        roi_transform_mat: Optional 4x4 ROI matrix for Native pipeline back-projection
+        interactive: If True, opens Open3D GUI window at each step (press 'q' to proceed)
+
+    Returns:
+        poses_4x4: List of detected 4x4 pose matrices in camera frame
+        scores: List of matching confidence scores
+        history: Step-by-step diagnostic records
+        peeled_layers: List of peeled point clouds per iteration for visual inspection
+    """
+    current_points = np.array(initial_scene_points_xyz_m, dtype=np.float64, copy=True)
+    cad_surface_pts = np.asarray(cad_mesh_o3d.sample_points_poisson_disk(number_of_points=12000).points)
+
+    detected_poses: list[np.ndarray] = []
+    detected_scores: list[float] = []
+    history: list[dict[str, Any]] = []
+    peeled_layers: list[np.ndarray] = []
+
+    instance_colors = [
+        [0.0, 0.85, 0.20],  # Instance 1: Green
+        [1.0, 0.80, 0.00],  # Instance 2: Yellow
+        [0.0, 0.75, 1.00],  # Instance 3: Cyan
+        [1.0, 0.20, 0.70],  # Instance 4: Magenta
+        [1.0, 0.50, 0.00],  # Instance 5: Orange
+        [0.5, 0.30, 0.90],  # Instance 6: Purple
+    ]
+
+    print(f"\n[*] Starting Sequential Subtraction Matching (Min Score: {min_score:.4f}, Subtraction Radius: {subtraction_radius*1000:.1f}mm, Max Iterations: {max_iterations})")
+    print(f"    Initial point count: {len(current_points):,}")
+
+    for iteration in range(1, max_iterations + 1):
+        if len(current_points) < 500:
+            print(f"[*] Stopping: remaining point count ({len(current_points)}) too small for matching.")
+            break
+
+        halcon_scene = create_halcon_point_cloud(current_points)
+        # Search for multiple candidates to ensure HALCON explores the global voting space without premature early-exit
+        config = surface_matching_config(matching_params, timeout_sec=5.0, min_score=min_score, num_matches=10)
+
+        t_start = time.perf_counter()
+        with SurfaceMatcher(model_point_cloud_halcon, config) as matcher:
+            match_res = matcher.match(halcon_scene)
+        iter_time_ms = (time.perf_counter() - t_start) * 1000.0
+
+        if not match_res.predictions:
+            print(f"[*] Iteration {iteration}: No hypotheses generated by HALCON.")
+            history.append({
+                "iteration": iteration,
+                "status": "NO_PREDICTIONS",
+                "runtime_ms": iter_time_ms,
+                "remaining_points": len(current_points),
+            })
+            break
+
+        # Strictly select the global highest-scoring candidate among all returned hypotheses
+        best_idx = int(np.argmax(match_res.scores))
+        best_pred = match_res.predictions[best_idx]
+        best_score = float(match_res.scores[best_idx])
+
+        if best_score < min_score:
+            print(f"[*] Stopping at Iteration {iteration}: Highest score {best_score:.4f} < min_score {min_score:.4f}")
+            history.append({
+                "iteration": iteration,
+                "status": "BELOW_THRESHOLD",
+                "score": float(best_score),
+                "runtime_ms": iter_time_ms,
+                "remaining_points": len(current_points),
+            })
+            break
+
+        # Convert to 4x4 matrix in camera frame
+        mat = np.eye(4, dtype=np.float64)
+        mat[:3, :3] = best_pred.rotation
+        mat[:3, 3] = best_pred.translation_mm / 1000.0
+
+        if roi_transform_mat is not None:
+            mat = roi_transform_mat @ mat
+
+        detected_poses.append(mat)
+        detected_scores.append(best_score)
+
+        # Spatial Point Subtraction using cKDTree
+        cad_trans = (mat[:3, :3] @ cad_surface_pts.T + mat[:3, 3:4]).T
+        cad_tree = cKDTree(cad_trans)
+
+        dists, _ = cad_tree.query(current_points, k=1, distance_upper_bound=subtraction_radius)
+        is_occupied = dists <= subtraction_radius
+        peeled_count = int(np.count_nonzero(is_occupied))
+
+        peeled_pts = current_points[is_occupied]
+        peeled_layers.append(peeled_pts)
+
+        # -------------------------------------------------------------
+        # STEP 1 VISUALIZATION: Matched instance + points to be removed (RED)
+        # -------------------------------------------------------------
+        if interactive:
+            pcd_scene_iter = o3d.geometry.PointCloud()
+            pcd_scene_iter.points = o3d.utility.Vector3dVector(current_points[~is_occupied])
+            pcd_scene_iter.paint_uniform_color([0.65, 0.65, 0.70])
+
+            pcd_peeled_iter = o3d.geometry.PointCloud()
+            pcd_peeled_iter.points = o3d.utility.Vector3dVector(peeled_pts)
+            pcd_peeled_iter.paint_uniform_color([1.0, 0.20, 0.20])
+
+            curr_mesh = copy.deepcopy(cad_mesh_o3d)
+            curr_mesh.transform(mat)
+            curr_mesh.paint_uniform_color([0.1, 0.9, 0.2])
+
+            prev_meshes = []
+            for p_idx, p_mat in enumerate(detected_poses[:-1]):
+                m = copy.deepcopy(cad_mesh_o3d)
+                m.transform(p_mat)
+                m.paint_uniform_color(instance_colors[p_idx % len(instance_colors)])
+                prev_meshes.append(m)
+
+            print(f"\n[>>> Open3D Window: Step {iteration} - Instance #{len(detected_poses)} Detected <<<]")
+            print(f"    - Score: {best_score:.4f} | Subtraction target: {peeled_count:,} points highlighted in RED")
+            print(f"    --> Rotate/zoom in 3D, then PRESS 'q' on keyboard to subtract points & proceed...")
+            win_title = f"Step {iteration}: Detected #{len(detected_poses)} (Score: {best_score:.3f}) | RED={peeled_count:,} pts to peel | Press 'q' to subtract"
+            o3d.visualization.draw_geometries([pcd_scene_iter, pcd_peeled_iter, curr_mesh, *prev_meshes], window_name=win_title, width=1440, height=900)
+
+        # Perform the subtraction
+        current_points = current_points[~is_occupied]
+
+        # -------------------------------------------------------------
+        # STEP 2 VISUALIZATION: Cleaned point cloud AFTER subtraction
+        # -------------------------------------------------------------
+        if interactive:
+            pcd_remaining = o3d.geometry.PointCloud()
+            pcd_remaining.points = o3d.utility.Vector3dVector(current_points)
+            pcd_remaining.paint_uniform_color([0.70, 0.75, 0.80])
+
+            accum_meshes = []
+            for p_idx, p_mat in enumerate(detected_poses):
+                m = copy.deepcopy(cad_mesh_o3d)
+                m.transform(p_mat)
+                m.paint_uniform_color(instance_colors[p_idx % len(instance_colors)])
+                accum_meshes.append(m)
+
+            print(f"[>>> Open3D Window: Step {iteration} - Point Cloud AFTER Subtraction <<<]")
+            print(f"    - Remaining points: {len(current_points):,}")
+            print(f"    --> Rotate/zoom to inspect cleaned scene, then PRESS 'q' to continue to next match...\n")
+            win_title = f"Step {iteration}: Point Cloud After Peeling (Remaining: {len(current_points):,} pts) | Press 'q' to continue"
+            o3d.visualization.draw_geometries([pcd_remaining, *accum_meshes], window_name=win_title, width=1440, height=900)
+
+        print(f"  [+] Iteration {iteration:2d}: Detected Instance #{len(detected_poses)} | Score: {best_score:.4f} | Peeled: {peeled_count:,} pts | Remaining: {len(current_points):,} pts ({iter_time_ms:.1f}ms)")
+
+        history.append({
+            "iteration": iteration,
+            "status": "ACCEPTED",
+            "score": float(best_score),
+            "pose": mat.tolist(),
+            "peeled_points": peeled_count,
+            "remaining_points": len(current_points),
+            "runtime_ms": iter_time_ms,
+        })
+
+    total_time_ms = sum(h.get("runtime_ms", 0.0) for h in history)
+    print(f"[*] Sequential Matching Finished: Detected {len(detected_poses)} instances across {len(history)} iterations (Total Time: {total_time_ms:.1f}ms).\n")
+
+    # -------------------------------------------------------------
+    # FINAL VISUALIZATION: All detected instances together
+    # -------------------------------------------------------------
+    if interactive and detected_poses:
+        print(f"[>>> Open3D Window: Final Multi-Instance Assembly <<<]")
+        print(f"    - Total instances detected: {len(detected_poses)}")
+        print(f"    --> Rotate/zoom, then PRESS 'q' to finish & save artifacts...\n")
+        pcd_final = o3d.geometry.PointCloud()
+        pcd_final.points = o3d.utility.Vector3dVector(current_points)
+        pcd_final.paint_uniform_color([0.65, 0.65, 0.70])
+        final_meshes = []
+        for p_idx, p_mat in enumerate(detected_poses):
+            m = copy.deepcopy(cad_mesh_o3d)
+            m.transform(p_mat)
+            m.paint_uniform_color(instance_colors[p_idx % len(instance_colors)])
+            final_meshes.append(m)
+        win_title = f"Finished: {len(detected_poses)} Instances Matched | Press 'q' to exit"
+        o3d.visualization.draw_geometries([pcd_final, *final_meshes], window_name=win_title, width=1440, height=900)
+
+    return detected_poses, detected_scores, history, peeled_layers
+
+
 def visualize_bop_scene(
     model_name: str,
     manifest_csv: Path,
@@ -228,6 +449,11 @@ def visualize_bop_scene(
     params: dict[str, Any],
     out_dir: Path,
     show_full_scene: bool = False,
+    sequential_subtraction: bool = False,
+    interactive: bool = False,
+    min_score: float = 0.50,
+    subtraction_radius: float = 0.005,
+    max_iterations: int = 10,
 ) -> None:
     """Run matching and visualization on a BOP dataset scene (e.g. itoddmv_val)."""
     print(f"\n==================== [BOP Scene] Model: {model_name} | Scene: {scene_id} | Image: {image_id} ====================")
@@ -273,21 +499,60 @@ def visualize_bop_scene(
     inv_roi_mat = np.linalg.inv(roi_mat)
     pts_h = np.column_stack([points_xyz_m, np.ones(len(points_xyz_m))])
     pts_roi = (inv_roi_mat @ pts_h.T).T[:, :3]
-    z_min, z_max = roi.get_z_range(is_bop=True)
     in_roi = (
         (pts_roi[:, 0] >= roi.x_range[0])
         & (pts_roi[:, 0] <= roi.x_range[1])
         & (pts_roi[:, 1] >= roi.y_range[0])
         & (pts_roi[:, 1] <= roi.y_range[1])
-        & (pts_roi[:, 2] >= z_min)
-        & (pts_roi[:, 2] <= z_max)
+        & (pts_roi[:, 2] >= roi.z_range[0])
+        & (pts_roi[:, 2] <= roi.z_range[1])
     )
 
-    # Match using HALCON on ROI-filtered points (or full scene if requested)
     match_pts = points_xyz_m if show_full_scene else points_xyz_m[in_roi]
-    halcon_scene = create_halcon_point_cloud(match_pts)
     halcon_model = _load_model(cad_path, "mm")
-    config = surface_matching_config(params, timeout_sec=5.0, min_score=0.01, num_matches=10)
+
+    if sequential_subtraction:
+        poses_4x4, scores, history, peeled_layers = sequential_subtraction_matching(
+            model_point_cloud_halcon=halcon_model,
+            cad_mesh_o3d=cad_mesh,
+            initial_scene_points_xyz_m=match_pts,
+            matching_params=params,
+            min_score=min_score,
+            subtraction_radius=subtraction_radius,
+            max_iterations=max_iterations,
+            interactive=interactive,
+        )
+
+        prefix = f"seq_sub_bop_{model_name}_s{scene_id}_im{image_id}"
+        render_2d_overlay(img_2d, cad_mesh, poses_4x4, camera.intrinsic_matrix, out_dir / f"{prefix}_2d_overlay.png", scores)
+        render_pts = points_xyz_m if show_full_scene else points_xyz_m[in_roi]
+        render_colors = point_colors if show_full_scene else point_colors[in_roi]
+        render_3d_pointcloud(render_pts, cad_mesh, poses_4x4, out_dir / f"{prefix}_3d_pointcloud.png", scene_colors=render_colors)
+        render_3d_pointcloud(points_xyz_m, cad_mesh, poses_4x4, out_dir / f"{prefix}_3d_raw_pointcloud.png", scene_colors=point_colors)
+        render_3d_pointcloud(render_pts, cad_mesh, poses_4x4, out_dir / f"{prefix}_3d_peeling_progression.png", peeled_points_list=peeled_layers)
+
+        meta = {
+            "pipeline": "sequential_subtraction",
+            "dataset": "bop_itoddmv_val",
+            "model": model_name,
+            "obj_id": obj_id,
+            "scene_id": scene_id,
+            "image_id": image_id,
+            "detected_count": len(poses_4x4),
+            "min_score": min_score,
+            "subtraction_radius_m": subtraction_radius,
+            "scores": scores,
+            "poses": [p.tolist() for p in poses_4x4],
+            "history": history,
+            "params": params,
+        }
+        (out_dir / f"{prefix}_meta.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
+        print(f"[+] Saved sequential subtraction metadata to {out_dir / f'{prefix}_meta.json'}")
+        return
+
+    # Standard one-shot matching
+    halcon_scene = create_halcon_point_cloud(match_pts)
+    config = surface_matching_config(params, timeout_sec=5.0, min_score=min_score, num_matches=10)
 
     with SurfaceMatcher(halcon_model, config) as matcher:
         match_res = matcher.match(halcon_scene)
@@ -307,6 +572,7 @@ def visualize_bop_scene(
     render_pts = points_xyz_m if show_full_scene else points_xyz_m[in_roi]
     render_colors = point_colors if show_full_scene else point_colors[in_roi]
     render_3d_pointcloud(render_pts, cad_mesh, poses_4x4, out_dir / f"{prefix}_3d_pointcloud.png", scene_colors=render_colors)
+    render_3d_pointcloud(points_xyz_m, cad_mesh, poses_4x4, out_dir / f"{prefix}_3d_raw_pointcloud.png", scene_colors=point_colors)
 
     # Save metadata JSON
     meta = {
@@ -331,6 +597,11 @@ def visualize_native_scene(
     params: dict[str, Any],
     out_dir: Path,
     show_full_scene: bool = False,
+    sequential_subtraction: bool = False,
+    interactive: bool = False,
+    min_score: float = 0.50,
+    subtraction_radius: float = 0.005,
+    max_iterations: int = 10,
 ) -> None:
     """Run matching and visualization on an ITODD Native scene (data/3d_long_baseline)."""
     print(f"\n==================== [ITODD Native Scene] Model: {model_name} | Scene: {scene_id} ====================")
@@ -362,12 +633,72 @@ def visualize_native_scene(
     # HALCON matching with ROI
     roi = ROIConfig()
     roi_mat, roi_pose_inv = compute_roi_transform(roi)
+
+    # Filter 3D points by ROI in camera frame
+    inv_roi_mat = np.linalg.inv(roi_mat)
+    pts_h = np.column_stack([points_xyz_m, np.ones(len(points_xyz_m))])
+    pts_roi = (inv_roi_mat @ pts_h.T).T[:, :3]
+    in_roi = (
+        (pts_roi[:, 0] >= roi.x_range[0]) & (pts_roi[:, 0] <= roi.x_range[1]) &
+        (pts_roi[:, 1] >= roi.y_range[0]) & (pts_roi[:, 1] <= roi.y_range[1]) &
+        (pts_roi[:, 2] >= roi.z_range[0]) & (pts_roi[:, 2] <= roi.z_range[1])
+    )
+
+    # CAD mesh for Open3D
+    cad_mesh = o3d.io.read_triangle_mesh(str(cad_path))
+    cad_mesh.compute_vertex_normals()
+    if np.asarray(cad_mesh.vertices).max() > 10.0:
+        cad_mesh.scale(0.001, center=(0, 0, 0))
+
+    # Approximate default camera K for ITODD sensor
+    cam_k = np.array([[2900.0, 0.0, img_2d.shape[1] / 2.0], [0.0, 2900.0, img_2d.shape[0] / 2.0], [0.0, 0.0, 1.0]])
+
+    model_point_cloud = load_original_cad(cad_path)
+
+    if sequential_subtraction:
+        init_pts = points_xyz_m if show_full_scene else points_xyz_m[in_roi]
+        poses_4x4, scores, history, peeled_layers = sequential_subtraction_matching(
+            model_point_cloud_halcon=model_point_cloud,
+            cad_mesh_o3d=cad_mesh,
+            initial_scene_points_xyz_m=init_pts,
+            matching_params=params,
+            min_score=min_score,
+            subtraction_radius=subtraction_radius,
+            max_iterations=max_iterations,
+            interactive=interactive,
+        )
+
+        prefix = f"seq_sub_native_{model_name}_scene{scene_id:04d}"
+        render_2d_overlay(img_2d, cad_mesh, poses_4x4, cam_k, out_dir / f"{prefix}_2d_overlay.png", scores)
+        render_pts = points_xyz_m if show_full_scene else points_xyz_m[in_roi]
+        render_colors = point_colors if show_full_scene else point_colors[in_roi]
+        render_3d_pointcloud(render_pts, cad_mesh, poses_4x4, out_dir / f"{prefix}_3d_pointcloud.png", scene_colors=render_colors)
+        render_3d_pointcloud(points_xyz_m, cad_mesh, poses_4x4, out_dir / f"{prefix}_3d_raw_pointcloud.png", scene_colors=point_colors)
+        render_3d_pointcloud(render_pts, cad_mesh, poses_4x4, out_dir / f"{prefix}_3d_peeling_progression.png", peeled_points_list=peeled_layers)
+
+        meta = {
+            "pipeline": "sequential_subtraction",
+            "dataset": "itodd_native_3d_long_baseline",
+            "model": model_name,
+            "scene_id": scene_id,
+            "detected_count": len(poses_4x4),
+            "min_score": min_score,
+            "subtraction_radius_m": subtraction_radius,
+            "scores": scores,
+            "poses": [p.tolist() for p in poses_4x4],
+            "history": history,
+            "params": params,
+        }
+        (out_dir / f"{prefix}_meta.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
+        print(f"[+] Saved sequential subtraction metadata to {out_dir / f'{prefix}_meta.json'}")
+        return
+
+    # Standard one-shot HALCON matching with ROI
     images = [ha.read_image(str(x_path)), ha.read_image(str(y_path)), ha.read_image(str(z_path))]
     scene_3d = ha.xyz_to_object_model_3d(*images)
     scene_roi = filter_scene_roi(scene_3d, roi_pose_inv, roi)
 
-    model_point_cloud = load_original_cad(cad_path)
-    config = surface_matching_config(params, timeout_sec=5.0, min_score=0.01, num_matches=10)
+    config = surface_matching_config(params, timeout_sec=5.0, min_score=min_score, num_matches=10)
 
     with SurfaceMatcher(model_point_cloud, config) as matcher:
         match_res = matcher.match(scene_roi)
@@ -385,28 +716,13 @@ def visualize_native_scene(
 
     print(f"[*] Found {len(poses_4x4)} matches in {match_res.runtime_ms:.1f}ms")
 
-    # CAD mesh for Open3D
-    cad_mesh = o3d.io.read_triangle_mesh(str(cad_path))
-    cad_mesh.compute_vertex_normals()
-
-    # Approximate default camera K for ITODD sensor
-    cam_k = np.array([[2900.0, 0.0, img_2d.shape[1] / 2.0], [0.0, 2900.0, img_2d.shape[0] / 2.0], [0.0, 0.0, 1.0]])
-
-    # Filter 3D points by ROI for 3D visualization
-    inv_roi_mat = np.linalg.inv(roi_mat)
-    pts_h = np.column_stack([points_xyz_m, np.ones(len(points_xyz_m))])
-    pts_roi = (inv_roi_mat @ pts_h.T).T[:, :3]
-    in_roi = (
-        (pts_roi[:, 0] >= roi.x_range[0]) & (pts_roi[:, 0] <= roi.x_range[1]) &
-        (pts_roi[:, 1] >= roi.y_range[0]) & (pts_roi[:, 1] <= roi.y_range[1]) &
-        (pts_roi[:, 2] >= roi.z_range[0]) & (pts_roi[:, 2] <= roi.z_range[1])
-    )
     render_pts = points_xyz_m if show_full_scene else points_xyz_m[in_roi]
     render_colors = point_colors if show_full_scene else point_colors[in_roi]
 
     prefix = f"native_{model_name}_scene{scene_id:04d}"
     render_2d_overlay(img_2d, cad_mesh, poses_4x4, cam_k, out_dir / f"{prefix}_2d_overlay.png", match_res.scores)
     render_3d_pointcloud(render_pts, cad_mesh, poses_4x4, out_dir / f"{prefix}_3d_pointcloud.png", scene_colors=render_colors)
+    render_3d_pointcloud(points_xyz_m, cad_mesh, poses_4x4, out_dir / f"{prefix}_3d_raw_pointcloud.png", scene_colors=point_colors)
 
     meta = {
         "dataset": "itodd_native_3d_long_baseline",
@@ -447,10 +763,23 @@ def main() -> int:
     parser.add_argument("--max-scenes", type=int, default=5, help="Max scenes to process from list (default: 5, set <=0 for all)")
     parser.add_argument("--show-full-scene", action="store_true", help="Render uncropped full scene point cloud instead of cropped ROI")
     parser.add_argument("--out-dir", type=Path, default=Path("visualizations/results"))
+    parser.add_argument("--sequential-subtraction", "--peeling", dest="sequential_subtraction", action="store_true", default=False, help="Enable recursive point cloud subtraction matching")
+    parser.add_argument("--interactive", dest="interactive", action="store_true", default=False, help="Enable step-by-step Open3D interactive visualization (press 'q' to proceed)")
+    parser.add_argument("--min-score", type=float, default=None, help="Minimum matching score threshold (default: study params or 0.50 for sequential subtraction, 0.01 for standard)")
+    parser.add_argument("--subtraction-radius", type=float, default=0.005, help="Point cloud peeling radius in metres (default: 0.005 = 5mm)")
+    parser.add_argument("--max-iterations", type=int, default=10, help="Maximum iterations per scene for sequential subtraction (default: 10)")
     args = parser.parse_args()
 
     args.out_dir.mkdir(parents=True, exist_ok=True)
     params = get_best_params_from_study(args.storage_dir, args.model) if args.storage_dir else dict(DEFAULT_PARAMS)
+    if args.min_score is not None:
+        min_score = float(args.min_score)
+        params["min_score"] = min_score
+        print(f"[+] Setting min_score from CLI: {min_score:.4f}")
+    else:
+        default_val = 0.50 if args.sequential_subtraction else 0.01
+        min_score = float(params.get("min_score", default_val))
+        params["min_score"] = min_score
 
     if args.dataset_type == "native":
         if args.scenes:
@@ -467,7 +796,18 @@ def main() -> int:
         print(f"[*] Processing {len(scene_ids)} native scenes: {scene_ids}")
         for scene_id in scene_ids:
             try:
-                visualize_native_scene(args.model, scene_id, params, args.out_dir, show_full_scene=args.show_full_scene)
+                visualize_native_scene(
+                    args.model,
+                    scene_id,
+                    params,
+                    args.out_dir,
+                    show_full_scene=args.show_full_scene,
+                    sequential_subtraction=args.sequential_subtraction,
+                    interactive=args.interactive,
+                    min_score=min_score,
+                    subtraction_radius=args.subtraction_radius,
+                    max_iterations=args.max_iterations,
+                )
             except Exception as e:
                 print(f"[!] Error processing native scene {scene_id}: {e}")
     else:
@@ -486,6 +826,11 @@ def main() -> int:
                     params=params,
                     out_dir=args.out_dir,
                     show_full_scene=args.show_full_scene,
+                    sequential_subtraction=args.sequential_subtraction,
+                    interactive=args.interactive,
+                    min_score=min_score,
+                    subtraction_radius=args.subtraction_radius,
+                    max_iterations=args.max_iterations,
                 )
             except Exception as e:
                 print(f"[!] Error processing BOP scene: {e}")

@@ -372,8 +372,8 @@ def backproject_depth(
 def filter_points_roi(
     points_xyz_m: np.ndarray,
     roi: Any = None,
-    *,
-    is_bop: bool = True,
+    *args: Any,
+    **kwargs: Any,
 ) -> np.ndarray:
     """Filter camera-frame 3D points by ROI bounding box, retaining camera coordinates."""
     if len(points_xyz_m) == 0:
@@ -396,18 +396,13 @@ def filter_points_roi(
     pts_h = np.column_stack([points_xyz_m, np.ones(len(points_xyz_m))])
     pts_roi = (inv_roi_mat @ pts_h.T).T[:, :3]
 
-    if hasattr(roi, "get_z_range"):
-        z_min, z_max = roi.get_z_range(is_bop=is_bop)
-    else:
-        z_min, z_max = roi.z_range
-
     in_roi = (
         (pts_roi[:, 0] >= roi.x_range[0])
         & (pts_roi[:, 0] <= roi.x_range[1])
         & (pts_roi[:, 1] >= roi.y_range[0])
         & (pts_roi[:, 1] <= roi.y_range[1])
-        & (pts_roi[:, 2] >= z_min)
-        & (pts_roi[:, 2] <= z_max)
+        & (pts_roi[:, 2] >= roi.z_range[0])
+        & (pts_roi[:, 2] <= roi.z_range[1])
     )
     return points_xyz_m[in_roi]
 
@@ -444,7 +439,7 @@ def load_bop_scene_data(
         stride=stride,
     )
     if use_roi:
-        points = filter_points_roi(points, roi=roi, is_bop=True)
+        points = filter_points_roi(points, roi=roi)
     return BOPSceneData(
         scene_id=scene_id,
         image_id=image_id,
