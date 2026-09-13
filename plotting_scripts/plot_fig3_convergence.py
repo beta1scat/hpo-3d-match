@@ -50,7 +50,7 @@ def main():
     setup_plt_style()
     
     models = [
-        ("bracket_planar", "(a) 薄板零件 (bracket_planar)"),
+        ("bracket_planar", "(a) 薄板件 (bracket_planar)"),
         ("screw_black", "(b) 连续对称螺栓 (screw_black)"),
         ("star", "(c) 离散对称把手 (star)"),
     ]
@@ -61,7 +61,7 @@ def main():
         ("Random", "random_nop_lexrecall_b500_s42", THEME_GRAY, ":", "Random 随机搜索基线"),
     ]
     
-    fig, axes = plt.subplots(1, 3, figsize=(13.5, 3.8), sharex=True)
+    fig, axes = plt.subplots(1, 3, figsize=(14.2, 4.8), sharex=True)
     
     for ax, (model_name, title) in zip(axes, models):
         for s_name, exp_suffix, color, ls, label in samplers:
@@ -69,19 +69,19 @@ def main():
             db_path = exp_dir / "studies" / f"{model_name}.db"
             trials, best_vals = extract_convergence_from_db(db_path)
             if trials:
-                ax.plot(trials, best_vals, label=label, color=color, linestyle=ls, lw=1.8)
+                ax.plot(trials, best_vals, label=label, color=color, linestyle=ls, lw=2.2)
         
-        ax.set_title(title, pad=8)
-        ax.set_xlabel("搜索试验轮数 (Trials)")
+        ax.set_title(title, pad=12)
+        ax.set_xlabel("搜索试验轮数 (Trials)", labelpad=6)
         ax.grid(True, linestyle="--", alpha=0.5)
         ax.set_xlim(0, 500)
     
-    axes[0].set_ylabel("当前历史最佳目标损失 $J_{\mathrm{train}}(\\boldsymbol{\\theta})$")
+    axes[0].set_ylabel(r"历史最佳目标损失 $J_{\mathrm{train}}(\theta)$", labelpad=10)
     # Place unified legend on top
     handles, labels = axes[0].get_legend_handles_labels()
-    fig.legend(handles, labels, loc="upper center", bbox_to_anchor=(0.5, 1.06), ncol=3, frameon=True)
+    fig.legend(handles, labels, loc="upper center", bbox_to_anchor=(0.5, 0.99), ncol=3, frameon=True, borderpad=0.5)
     
-    plt.tight_layout()
+    plt.tight_layout(rect=[0, 0, 1, 0.88])
     save_fig(fig, "ch3_fig3_convergence")
     plt.close()
 

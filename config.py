@@ -1,4 +1,4 @@
-"""Configuration for models, search spaces, ROI, and dataset paths.
+"""Configuration for models, search spaces, RANSAC tabletop filtering, and dataset paths.
 
 Model configurations for three ITODD objects:
   - star:            12-fold rotational symmetry (symmetryAngle=30, checkAxis=3)
@@ -50,40 +50,16 @@ DEFAULT_PARAMS = {
 
 
 # ---------------------------------------------------------------------------
-# ROI configuration (shared across all scenes in ITODD)
+# RANSAC tabletop removal distance thresholds (in meters)
+#   star:            1.0 mm -> 0.0010 m
+#   bracket_planar:  0.8 mm -> 0.0008 m
+#   screw_black:     4.0 mm -> 0.0040 m
 # ---------------------------------------------------------------------------
-@dataclass
-class ROIConfig:
-    """Region of Interest box and transform for scene filtering."""
-
-    # 4x4 Homogeneous Transformation Matrix in camera frame
-    matrix: Tuple[Tuple[float, ...], ...] = (
-        (0.992053687572, 0.000117960000, -0.125815242529, 0.003062009811),
-        (0.000092490001, 0.999998509884, 0.001666859956, -0.000230103731),
-        (0.125815272331, -0.001665250049, 0.992052197456, 0.721286177635),
-        (0.000000000000, 0.000000000000, 0.000000000000, 1.000000000000),
-    )
-
-    # ROI pose (translation in meters, rotation in degrees)
-    tx: float = 0.003062009811
-    ty: float = -0.000230103731
-    tz: float = 0.721286177635
-    rx: float = -0.096269078
-    ry: float = -7.227837405
-    rz: float = -0.006812746
-
-    # Bounding box extents (meters): Dx=0.30939281, Dy=0.23774898, Dz=0.08699393
-    # Z range: [-Dz/2, 0.0432] with upper bound clamped to 0.0432m to filter tabletop
-    x_range: Tuple[float, float] = (-0.30939281 / 2, 0.30939281 / 2)
-    y_range: Tuple[float, float] = (-0.23774898 / 2, 0.23774898 / 2)
-
-    # Native
-    # z_range: Tuple[float, float] = (-0.05, 0.022) # For bracket_planar
-    # z_range: Tuple[float, float] = (-0.05, 0.022) # For star and screw_black
-
-    # BOP
-    z_range: Tuple[float, float] = (-0.05, 0.025) # For bracket_planar
-    # z_range: Tuple[float, float] = (-0.05, 0.022) # For star and screw_black
+RANSAC_TABLETOP_THRESHOLDS: Dict[str, float] = {
+    "star": 0.0010,
+    "bracket_planar": 0.0008,
+    "screw_black": 0.0040,
+}
 
 
 # ---------------------------------------------------------------------------
@@ -99,6 +75,7 @@ class ModelConfig:
     check_axis: int = 3  # number of rotation axes to check
     symmetry_angle: Optional[float] = None  # degrees, for discrete rotational symmetry
     gt_z_offset: float = 0.0  # ground truth Z-axis correction (mm)
+    ransac_threshold_m: float = 0.0020  # meters, default RANSAC plane removal threshold
 
     @property
     def penalty_per_miss(self) -> float:
@@ -113,17 +90,20 @@ MODEL_CONFIGS: Dict[str, ModelConfig] = {
         check_axis=3,
         symmetry_angle=30.0,
         gt_z_offset=-5.68374,  # known GT error in Z-axis
+        ransac_threshold_m=0.0010,
     ),
     "screw_black": ModelConfig(
         name="screw_black",
         check_axis=2,
         symmetry_angle=None,  # fully axially symmetric
+        ransac_threshold_m=0.0040,
     ),
     "bracket_planar": ModelConfig(
         name="bracket_planar",
         check_axis=3,
         symmetry_angle=None,  # no rotational symmetry
         gt_z_offset=-5.68374,  # known GT error in Z-axis (same as star)
+        ransac_threshold_m=0.0008,
     ),
 }
 

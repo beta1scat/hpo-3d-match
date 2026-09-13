@@ -369,42 +369,54 @@ def backproject_depth(
     return points[np.all(np.isfinite(points), axis=1)]
 
 
-def filter_points_roi(
+def filter_points_ransac_tabletop(
     points_xyz_m: np.ndarray,
-    roi: Any = None,
-    *args: Any,
-    **kwargs: Any,
-) -> np.ndarray:
-    """Filter camera-frame 3D points by ROI bounding box, retaining camera coordinates."""
-    if len(points_xyz_m) == 0:
+    distance_threshold_m: float = 0.002,
+    ransac_n: int = 3,
+    num_iterations: int = 1000,
+    return_mask: bool = False,
+) -> np.ndarray | tuple[np.ndarray, np.ndarray]:
+    """Filter tabletop plane from scene point cloud using Open3D RANSAC plane segmentation.
+
+    Args:
+        points_xyz_m: (N, 3) point cloud in camera frame (meters).
+        distance_threshold_m: Distance threshold from plane in meters.
+        ransac_n: Number of initial points to estimate a plane.
+        num_iterations: Number of RANSAC iterations.
+        return_mask: If True, returns (filtered_points, outlier_mask) tuple.
+
+    Returns:
+        (M, 3) Outlier points (object points with tabletop removed), or tuple with mask.
+    """
+    if len(points_xyz_m) < 100:
+        if return_mask:
+            return points_xyz_m, np.ones(len(points_xyz_m), dtype=bool)
         return points_xyz_m
 
-    if roi is None:
-        from config import ROIConfig
+    import open3d as o3d
 
-        roi = ROIConfig()
+    # Lock seed for reproducibility
+    o3d.utility.random.seed(42)
 
-    roi_mat = (
-        np.array(roi.matrix, dtype=np.float64)
-        if hasattr(roi, "matrix") and roi.matrix is not None
-        else None
+    pcd = o3d.geometry.PointCloud()
+    pcd.points = o3d.utility.Vector3dVector(
+        np.ascontiguousarray(points_xyz_m, dtype=np.float64)
     )
-    if roi_mat is None:
+    plane_model, inliers = pcd.segment_plane(
+        distance_threshold=distance_threshold_m,
+        ransac_n=ransac_n,
+        num_iterations=num_iterations,
+    )
+    if len(inliers) == 0:
+        if return_mask:
+            return points_xyz_m, np.ones(len(points_xyz_m), dtype=bool)
         return points_xyz_m
 
-    inv_roi_mat = np.linalg.inv(roi_mat)
-    pts_h = np.column_stack([points_xyz_m, np.ones(len(points_xyz_m))])
-    pts_roi = (inv_roi_mat @ pts_h.T).T[:, :3]
-
-    in_roi = (
-        (pts_roi[:, 0] >= roi.x_range[0])
-        & (pts_roi[:, 0] <= roi.x_range[1])
-        & (pts_roi[:, 1] >= roi.y_range[0])
-        & (pts_roi[:, 1] <= roi.y_range[1])
-        & (pts_roi[:, 2] >= roi.z_range[0])
-        & (pts_roi[:, 2] <= roi.z_range[1])
-    )
-    return points_xyz_m[in_roi]
+    outlier_mask = np.ones(len(points_xyz_m), dtype=bool)
+    outlier_mask[inliers] = False
+    if return_mask:
+        return points_xyz_m[outlier_mask], outlier_mask
+    return points_xyz_m[outlier_mask]
 
 
 def load_bop_scene_data(
@@ -418,8 +430,8 @@ def load_bop_scene_data(
     min_visib_fract: float = DEFAULT_MIN_VISIB_FRACT,
     depth_range_m: Sequence[float] | None = None,
     stride: int = 1,
-    use_roi: bool = False,
-    roi: Any = None,
+    filter_tabletop: bool = False,
+    ransac_threshold_m: float | None = None,
 ) -> BOPSceneData:
     """Load a BOP scene query without importing or requiring HALCON."""
 
@@ -432,14 +444,26 @@ def load_bop_scene_data(
         obj_id,
         min_visib_fract=min_visib_fract,
     )
-    points = backproject_depth(
-        read_depth_image(depth_path),
-        camera,
-        depth_range_m=depth_range_m,
-        stride=stride,
-    )
-    if use_roi:
-        points = filter_points_roi(points, roi=roi)
+    depth_p = Path(depth_path).expanduser().resolve()
+    cached_ply = depth_p.parent.parent / "points_tabletop_filtered" / f"{image_id:06d}_filtered.ply"
+    if filter_tabletop and cached_ply.is_file():
+        import open3d as o3d
+        pcd = o3d.io.read_point_cloud(str(cached_ply))
+        points = np.asarray(pcd.points, dtype=np.float64)
+    else:
+        points = backproject_depth(
+            read_depth_image(depth_path),
+            camera,
+            depth_range_m=depth_range_m,
+            stride=stride,
+        )
+        if filter_tabletop:
+            if ransac_threshold_m is None:
+                threshold_map = {25: 0.0010, 5: 0.0008, 24: 0.0040}
+                ransac_threshold_m = threshold_map.get(obj_id, 0.0020)
+            points = filter_points_ransac_tabletop(
+                points, distance_threshold_m=ransac_threshold_m
+            )
     return BOPSceneData(
         scene_id=scene_id,
         image_id=image_id,
@@ -477,8 +501,8 @@ def load_bop_scene(
     min_visib_fract: float = DEFAULT_MIN_VISIB_FRACT,
     depth_range_m: Sequence[float] | None = None,
     stride: int = 1,
-    use_roi: bool = False,
-    roi: Any = None,
+    filter_tabletop: bool = False,
+    ransac_threshold_m: float | None = None,
 ) -> tuple[object, list[PoseRecord]]:
     """Return a HALCON scene point cloud and matching BOP GT pose list."""
 
@@ -493,8 +517,8 @@ def load_bop_scene(
         min_visib_fract=min_visib_fract,
         depth_range_m=depth_range_m,
         stride=stride,
-        use_roi=use_roi,
-        roi=roi,
+        filter_tabletop=filter_tabletop,
+        ransac_threshold_m=ransac_threshold_m,
     )
     return create_halcon_point_cloud(data.points_xyz_m), list(data.ground_truths)
 

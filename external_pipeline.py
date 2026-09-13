@@ -12,13 +12,16 @@ from typing import Any, Mapping
 import halcon as ha
 import numpy as np
 
-from config import DEFAULT_PARAMS, ROIConfig
+from bop_scene_loader import (
+    create_halcon_point_cloud,
+    filter_points_ransac_tabletop,
+)
+from config import DEFAULT_PARAMS, RANSAC_TABLETOP_THRESHOLDS
 from dataset import ITODD_EXTERNAL_MANIFEST_FIELDS, TARGET_OBJECT_IDS
 from evaluation import PoseRecord
 from experiment_io import append_jsonl, generate_run_id
 from matcher import MatchError, MatchTimeout, SurfaceMatcher
 from pipeline import surface_matching_config
-from scene_loader import compute_roi_transform, filter_scene_roi
 
 
 DATASET_NAME = "itodd_original"
@@ -156,21 +159,27 @@ def read_external_queries(
     return tuple(queries[scene_id] for scene_id in sorted(queries))
 
 
-def load_xyz_point_cloud(query: ExternalQuery) -> Any:
-    """Create a HALCON object model directly from manifest X/Y/Z TIF files."""
+def load_xyz_point_cloud(
+    query: ExternalQuery,
+    distance_threshold_m: float | None = None,
+) -> Any:
+    """Create a HALCON object model from manifest X/Y/Z TIF files, removing tabletop with RANSAC."""
 
-    images = []
-    try:
-        images = [
-            ha.read_image(str(query.x_path)),
-            ha.read_image(str(query.y_path)),
-            ha.read_image(str(query.z_path)),
-        ]
-        return ha.xyz_to_object_model_3d(*images)
-    finally:
-        # HALCON Python iconic images are reference-counted; dropping all local
-        # references releases them after xyz_to_object_model_3d has copied them.
-        images.clear()
+    import imageio.v3 as iio
+
+    x_img = np.asarray(iio.imread(query.x_path))
+    y_img = np.asarray(iio.imread(query.y_path))
+    z_img = np.asarray(iio.imread(query.z_path))
+    valid = np.isfinite(z_img) & (z_img > 0.05) & (z_img < 1.5)
+    points = np.stack(
+        [x_img[valid], y_img[valid], z_img[valid]], axis=-1
+    ).astype(np.float64)
+
+    if distance_threshold_m is not None:
+        points = filter_points_ransac_tabletop(
+            points, distance_threshold_m=distance_threshold_m
+        )
+    return create_halcon_point_cloud(points)
 
 
 def load_original_cad(cad_path: str | Path) -> Any:
@@ -192,20 +201,6 @@ def load_original_cad(cad_path: str | Path) -> Any:
         if cleanup_error is not None and not active_exception:
             _clear_object_models((model_with_normals,))
             raise cleanup_error
-
-
-def transform_roi_pose_to_scene(pose: PoseRecord, roi_mat: np.ndarray) -> PoseRecord:
-    """Left-multiply an ROI-frame model pose into original scene coordinates."""
-
-    pose_roi_m = np.eye(4, dtype=np.float64)
-    pose_roi_m[:3, :3] = pose.rotation
-    pose_roi_m[:3, 3] = pose.translation_mm / 1000.0
-    pose_scene_m = np.asarray(roi_mat, dtype=np.float64) @ pose_roi_m
-    return PoseRecord(
-        translation_mm=pose_scene_m[:3, 3] * 1000.0,
-        rotation=pose_scene_m[:3, :3],
-        record_id=pose.record_id,
-    )
 
 
 def _pose_json(pose: PoseRecord) -> dict[str, list[float]]:
@@ -246,14 +241,23 @@ def _clear_object_models(handles: tuple[Any | None, ...]) -> MatchError | None:
 
 
 class ExternalPipeline:
-    """Run fixed matching on original ITODD scenes without GT evaluation."""
+    """Run fixed matching on original ITODD scenes with RANSAC tabletop removal."""
 
-    def __init__(self, manifest_path: str | Path, model_name: str) -> None:
+    def __init__(
+        self,
+        manifest_path: str | Path,
+        model_name: str,
+        ransac_threshold_m: float | None = None,
+    ) -> None:
         self.manifest_path = Path(manifest_path).expanduser().resolve()
         self.model_name = model_name
         self.queries = read_external_queries(self.manifest_path, model_name)
-        self.roi = ROIConfig()
-        self.roi_mat, self.roi_pose_inv = compute_roi_transform(self.roi)
+        if ransac_threshold_m is not None:
+            self.ransac_threshold_m = float(ransac_threshold_m)
+        else:
+            self.ransac_threshold_m = RANSAC_TABLETOP_THRESHOLDS.get(
+                model_name, 0.0020
+            )
 
     def evaluate_fixed_params(
         self,
@@ -301,18 +305,13 @@ class ExternalPipeline:
                 status = "COMPLETE"
                 error: dict[str, str] | None = None
                 scene_3d = None
-                scene_roi = None
                 scene_start = perf_counter()
                 try:
-                    scene_3d = load_xyz_point_cloud(query)
-                    scene_roi = filter_scene_roi(
-                        scene_3d, self.roi_pose_inv, self.roi
+                    scene_3d = load_xyz_point_cloud(
+                        query, distance_threshold_m=self.ransac_threshold_m
                     )
-                    match_result = matcher.match(scene_roi)
-                    predictions = tuple(
-                        transform_roi_pose_to_scene(pose, self.roi_mat)
-                        for pose in match_result.predictions
-                    )
+                    match_result = matcher.match(scene_3d)
+                    predictions = match_result.predictions
                     scores = match_result.scores
                 except MatchTimeout as exc:
                     status = "TIMEOUT"
@@ -322,7 +321,7 @@ class ExternalPipeline:
                     error = {"type": type(exc).__name__, "message": str(exc)}
                 finally:
                     active_exception = sys.exc_info()[0] is not None
-                    cleanup_error = _clear_object_models((scene_roi, scene_3d))
+                    cleanup_error = _clear_object_models((scene_3d,))
                     if cleanup_error is not None:
                         if error is None and not active_exception:
                             raise cleanup_error
@@ -446,5 +445,4 @@ __all__ = [
     "load_xyz_point_cloud",
     "read_external_queries",
     "run_external_pipeline",
-    "transform_roi_pose_to_scene",
 ]

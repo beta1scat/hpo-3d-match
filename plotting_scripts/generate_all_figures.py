@@ -1,11 +1,13 @@
 """Generate all Chapter 3 figures for the PhD thesis.
 
 Imports and executes each plotting script sequentially:
+  - Figure 3-1: Deterministic RANSAC tabletop removal (plot_fig1_ransac_tabletop.py)
   - Figure 3-3: Optimization convergence curves (plot_fig3_convergence.py)
   - Figure 3-4: Objective formulation ablation (plot_fig4_objective_ablation.py)
   - Figure 3-5: Median Pruner acceleration efficiency (plot_fig5_pruning_analysis.py)
   - Figure 3-6: Hyperparameter importance via fANOVA (plot_fig6_param_importance.py)
-  - Figure 3-7: Sim2Real PBR vs Real Oracle comparison (plot_fig7_sim_vs_oracle.py)
+  - Figure 3-7: Default baseline vs Real Oracle comparison (plot_fig7_sim_vs_oracle.py)
+  - Figures 3-8 ~ 3-10: 15 representative scenes qualitative comparison (plot_qualitative_comparison.py)
 """
 
 import sys
@@ -15,11 +17,13 @@ from pathlib import Path
 SCRIPTS_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPTS_DIR))
 
+import plot_fig1_ransac_tabletop
 import plot_fig3_convergence
 import plot_fig4_objective_ablation
 import plot_fig5_pruning_analysis
 import plot_fig6_param_importance
 import plot_fig7_sim_vs_oracle
+import plot_qualitative_comparison
 
 
 def main():
@@ -27,20 +31,32 @@ def main():
     print("Generating Chapter 3 Figures for PhD Thesis...")
     print("==================================================")
 
-    print("\n[1/5] Plotting Figure 3-3: Convergence Curves...")
+    print("\n[1/7] Plotting Figure 3-1: Deterministic RANSAC Tabletop Removal...")
+    plot_fig1_ransac_tabletop.main()
+
+    print("\n[2/7] Plotting Figure 3-3: Convergence Curves...")
     plot_fig3_convergence.main()
 
-    print("\n[2/5] Plotting Figure 3-4: Objective Formulation Ablation...")
+    print("\n[3/7] Plotting Figure 3-4: Objective Formulation Ablation...")
     plot_fig4_objective_ablation.main()
 
-    print("\n[3/5] Plotting Figure 3-5: Pruning Acceleration Efficiency...")
+    print("\n[4/7] Plotting Figure 3-5: Pruning Acceleration Efficiency...")
     plot_fig5_pruning_analysis.main()
 
-    print("\n[4/5] Plotting Figure 3-6: Hyperparameter Importance (fANOVA)...")
+    print("\n[5/7] Plotting Figure 3-6: Hyperparameter Importance (fANOVA)...")
     plot_fig6_param_importance.main()
 
-    print("\n[5/5] Plotting Figure 3-7: Sim2Real PBR vs Real Oracle...")
+    print("\n[6/7] Plotting Figure 3-7: Default Baseline vs Real Oracle...")
     plot_fig7_sim_vs_oracle.main()
+
+    print("\n[7/7] Plotting Qualitative 2D/3D Pose Comparison Figures (600 DPI)...")
+    # Generate for all three models
+    sys_argv_backup = list(sys.argv)
+    sys.argv = ["plot_qualitative_comparison.py", "--all", "--dpi", "600"]
+    try:
+        plot_qualitative_comparison.main()
+    finally:
+        sys.argv = sys_argv_backup
 
     print("\n==================================================")
     print("All Chapter 3 figures successfully generated!")

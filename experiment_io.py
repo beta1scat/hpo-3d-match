@@ -281,7 +281,6 @@ def collect_manifest(
     run_id: str | None = None,
     cli_config: Any = None,
     search_space: Any = None,
-    roi: Any = None,
     object_mapping: Any = None,
     input_files: Mapping[str, str | os.PathLike[str]]
     | Iterable[str | os.PathLike[str]] = (),
@@ -308,7 +307,6 @@ def collect_manifest(
         "git": collect_git_info(repo_path),
         "cli_config": cli_config,
         "search_space": search_space,
-        "roi": roi,
         "object_mapping": object_mapping,
         "input_files": collect_input_files(input_files),
     }

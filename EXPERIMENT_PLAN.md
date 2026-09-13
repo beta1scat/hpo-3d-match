@@ -3,11 +3,14 @@
 **活动实验协议 ID**：`hpo-3d-match-scene0-matrix-v2`  
 **标准配置文件**：`configs/hpo_protocol.json`  
 **合成域训练清单**：`data/manifests/itodd_scene0_v1/bop_manifest.csv` (Scene 0 PBR, 8:2 Train/Dev)  
-**真实域验证清单**：`data/manifests/itoddmv_val/bop_manifest.csv` (ITODD-MV 真实标注验证集)  
+**真实域标定清单**：`data/manifests/itodd_manual_annotated/bop_manifest.csv` (最新 19 场景物理传感器标定真实数据集)  
 **原生工业场景清单**：`data/manifests/itodd_external/itodd_external_manifest.csv` (data/3d_long_baseline 原生工业点云)  
 **统一实验执行引擎**：`run_experiment.py` / `main.py`  
+**离线点云确定性滤波工具**：`preprocess_filter_tabletop.py` (固化纯工件点云至 points_tabletop_filtered/*.ply)  
 **结果规整与汇总工具**：`summarize_results.py`  
-**论文标准 4K 可视化工具**：`visualize_results.py`  
+**论文标准 4K 可视化工具**：`visualize_results.py` (生成原生工业场景 2D/3D 渲染图件)  
+**出版级定性对比图组装工具**：`plotting_scripts/plot_qualitative_comparison.py` (4行x5列 600 DPI 矢量/超清对比大图)  
+**全章实验图件一键生成流水线**：`plotting_scripts/generate_all_figures.py` (图 3-3 至图 3-7 全量自动绘制)  
 **对应论文章节**：博士学位论文第三章《数据驱动的点云位姿估计算法参数离线优化方法》
 
 ---
@@ -27,8 +30,8 @@
 ### 1.2 数据集划分与隔离学术规范
 
 1. **合成域寻优（Sim HPO）**：基于 `data/manifests/itodd_scene0_v1/bop_manifest.csv`，严格按 8:2 隔离为 `train`（寻优）与 `dev`（验证选模）。
-2. **迁移验证（Sim-to-Real）**：将合成域选出的最佳模型参数直接迁移至完全独立的真实世界数据集 `itoddmv_val` 上进行定量评测（输出 TP, FP, FN, F1, Recall）。
-3. **真实理论上限（Real Oracle）**：将 `itoddmv_val` 接入优化器寻优，确立工业无序抓取的理论物理性能极限。
+2. **真实域理论上限寻优（Real-to-Real Oracle）**：完全独立于合成数据，直接在最新的 19 场景真实工业手动标定数据集 `data/manifests/itodd_manual_annotated/bop_manifest.csv` 上运行大规模 HPO 寻优，结合各工件物理标定阈值的自适应 RANSAC 桌面点云剔除算子，建立物理真实域参数优化的理论性能天花板（Real-to-Real）。原 `itoddmv_val` 实验废止。
+3. **合成与真实分离评价范式**：放弃效果受限的跨域 Sim-to-Real 零样本迁移方案，采取合成域（Sim）与真实域（Real）各自独立寻优、独立评价的实验范式，分别系统论证算法在仿真域与物理真实域的寻优收敛性与工业适用性。
 4. **原生场景定性验证（Native Validation）**：在无 GT 标注的原生 ITODD 工业点云（`data/3d_long_baseline`）上运行固定前向推理，进行全视角 4K 超高清定性可视化展示。
 
 ---
@@ -75,15 +78,18 @@ $$\mathbf{results/\{model\}\_\{sampler\}\_\{pruner\}\_\{objective\}\_b\{budget\}
 在执行大规模 HPO 寻优前，独立评测未优化状态下的算法性能（用于支撑 Table 3.4 与 Table 3.7 的 Default 基线对比）：
 
 ```powershell
+# 0. 真实域点云确定性去桌面离线预处理 (固化 19 个真实标定场景工件点云至 points_tabletop_filtered/*.ply，彻底杜绝动态 RANSAC 随机扰动)
+uv run python preprocess_filter_tabletop.py
+
 # 1. 合成域 Dev 集默认参数评测 (Scene 0 Dev，用于 Table 3.4 基线)
 uv run python main.py evaluate-default --bop-manifest data/manifests/itodd_scene0_v1/bop_manifest.csv --model bracket_planar --split dev --results-root results/baseline_default_scene0/bracket_planar --run-id eval-default-dev
 uv run python main.py evaluate-default --bop-manifest data/manifests/itodd_scene0_v1/bop_manifest.csv --model screw_black --split dev --results-root results/baseline_default_scene0/screw_black --run-id eval-default-dev
 uv run python main.py evaluate-default --bop-manifest data/manifests/itodd_scene0_v1/bop_manifest.csv --model star --split dev --results-root results/baseline_default_scene0/star --run-id eval-default-dev
 
-# 2. 真实域 Val 集默认参数评测 (ITODD-MV Val 启用 3D ROI 预处理，用于 Table 3.7 基线)
-uv run python main.py evaluate-default --bop-manifest data/manifests/itoddmv_val/bop_manifest.csv --model bracket_planar --split dev --use-roi --results-root results/baseline_default_itoddmv/bracket_planar --run-id eval-default-val-roi
-uv run python main.py evaluate-default --bop-manifest data/manifests/itoddmv_val/bop_manifest.csv --model screw_black --split dev --use-roi --results-root results/baseline_default_itoddmv/screw_black --run-id eval-default-val-roi
-uv run python main.py evaluate-default --bop-manifest data/manifests/itoddmv_val/bop_manifest.csv --model star --split dev --use-roi --results-root results/baseline_default_itoddmv/star --run-id eval-default-val-roi
+# 2. 真实域手动标注数据集默认参数评测 (启用 RANSAC 桌面点云剔除预处理，用于 Table 3.7 真实基线)
+uv run python main.py evaluate-default --bop-manifest data/manifests/itodd_manual_annotated/bop_manifest.csv --model bracket_planar --split dev --filter-tabletop --results-root results/baseline_default_manual/bracket_planar --run-id eval-default-manual-ransac
+uv run python main.py evaluate-default --bop-manifest data/manifests/itodd_manual_annotated/bop_manifest.csv --model screw_black --split dev --filter-tabletop --results-root results/baseline_default_manual/screw_black --run-id eval-default-manual-ransac
+uv run python main.py evaluate-default --bop-manifest data/manifests/itodd_manual_annotated/bop_manifest.csv --model star --split dev --filter-tabletop --results-root results/baseline_default_manual/star --run-id eval-default-manual-ransac
 ```
 
 ---
@@ -127,74 +133,69 @@ uv run python run_experiment.py --model star --sampler TPE --pruner Median --bud
 
 ---
 
-### 阶段四：Sim-to-Real 定量迁移验证（在真实数据集 itoddmv_val 上评估）
-将合成域优化出的最佳参数模型直接加载并在真实世界场景 `itoddmv_val` 上进行定量评测：
+### 阶段四：真实域理论上限寻优（Real-to-Real Oracle 1000 轮极限寻优）
+
+放弃效果受限的跨域 Sim-to-Real 迁移方案，直接在最新的 19 场景真实工业手动标定数据集 `data/manifests/itodd_manual_annotated/bop_manifest.csv` 上开展大规模 Real-to-Real HPO 极限寻优，建立真实工业场景下的理论物理性能天花板（原 `itoddmv_val` 实验全面作废）。
+
+通过显式指定 `--results-root`，结果保存至独立的真实域目录，系统自动识别 `itodd_manual_annotated` 真实数据集并开启 **桌面点云 RANSAC 滤波预处理**（star: 1.0mm, bracket: 0.8mm, screw_black: 4.0mm，剔除料框桌面冗余点，大幅加速匹配收敛），自动均匀记录 10 个 Checkpoints：
+
 ```powershell
-# 薄板工件 Sim-to-Real 评测
-uv run python main.py evaluate-best --bop-manifest data/manifests/itoddmv_val/bop_manifest.csv --study-bop-manifest data/manifests/itodd_scene0_v1/bop_manifest.csv --model bracket_planar --split test --storage-dir results/bracket_planar_tpe_nop_lexrecall_b500_s42/studies --sampler TPE --pruner Nop --repeat 0 --seed 42 --results-root results/bracket_planar_tpe_nop_lexrecall_b500_s42/evaluations --run-id eval-sim2real-val
+# 薄板 bracket_planar 真实域 1000 轮 Oracle 寻优 (19 场景，物理阈值 0.8mm)
+uv run python run_experiment.py --model bracket_planar --sampler TPE --pruner Median --budget 1000 --manifest data/manifests/itodd_manual_annotated/bop_manifest.csv --results-root results/itodd_manual_annotated_bracket_planar_tpe_median_lexrecall_b1000_s42 --allow-query-overlap --seed 42
 
-# 黑色螺丝 Sim-to-Real 评测
-uv run python main.py evaluate-best --bop-manifest data/manifests/itoddmv_val/bop_manifest.csv --study-bop-manifest data/manifests/itodd_scene0_v1/bop_manifest.csv --model screw_black --split test --storage-dir results/screw_black_tpe_nop_lexrecall_b500_s42/studies --sampler TPE --pruner Nop --repeat 0 --seed 42 --results-root results/screw_black_tpe_nop_lexrecall_b500_s42/evaluations --run-id eval-sim2real-val
+# 黑色螺丝 screw_black 真实域 1000 轮 Oracle 寻优 (19 场景，物理阈值 4.0mm)
+uv run python run_experiment.py --model screw_black --sampler TPE --pruner Median --budget 1000 --manifest data/manifests/itodd_manual_annotated/bop_manifest.csv --results-root results/itodd_manual_annotated_screw_black_tpe_median_lexrecall_b1000_s42 --allow-query-overlap --seed 42
 
-# 星形手柄 Sim-to-Real 评测
-uv run python main.py evaluate-best --bop-manifest data/manifests/itoddmv_val/bop_manifest.csv --study-bop-manifest data/manifests/itodd_scene0_v1/bop_manifest.csv --model star --split test --storage-dir results/star_tpe_nop_lexrecall_b500_s42/studies --sampler TPE --pruner Nop --repeat 0 --seed 42 --results-root results/star_tpe_nop_lexrecall_b500_s42/evaluations --run-id eval-sim2real-val
+# 星形调节把手 star 真实域 1000 轮 Oracle 寻优 (19 场景，物理阈值 1.0mm)
+uv run python run_experiment.py --model star --sampler TPE --pruner Median --budget 1000 --manifest data/manifests/itodd_manual_annotated/bop_manifest.csv --results-root results/itodd_manual_annotated_star_tpe_median_lexrecall_b1000_s42 --allow-query-overlap --seed 42
 ```
+> **论文对应成果**：
+> - **Table 3.7**：《物理真实工业场景默认基线与 Real-to-Real 理论性能天花板对比表》；
+> - **Figure 3.7**：《真实工业场景下 1000 轮贝叶斯参数优化演进轨迹与收敛曲线图》。
 
 ---
 
-### 阶段五：真实域理论上限 (Oracle) 与原生场景 4K 超高清定性可视化
+### 阶段五：原生工业场景定性可视化与出版级 4 行 $\times$ 5 列对比图件生成
 
-#### 1. Real Oracle 寻优（在 itoddmv_val 上运行 1000 轮获得物理极限参数）
-通过显式指定 `--results-root`，确保结果保存至带有数据集标识的独立目录中，自动等分 10 个 Checkpoints。系统自动识别 `itoddmv_val` 真实数据集并开启 **3D ROI 滤波预处理**（$Z_{\max}^{\text{bop}} = +0.0360\,\text{m}$，剔除 70 余万工作台面冗余点，大幅加速匹配收敛）：
+#### 1. 原生工业场景全量场景 2D/3D 可视化渲染（全量覆盖各工件 scene_list 中的全部场景）
+在无真值标注的 ITODD 原生工业场景中，对三大工件的所有原生工业场景（Star 共 50 个场景、Screw_Black 共 23 个场景、Bracket_Planar 共 39 个场景）进行全量批处理匹配与渲染。分别使用官方默认参数（`native_default_<model>`）与 Real Oracle 5000 轮最优参数（`native_<model>_oracle`）渲染保存 2D 轮廓投影叠加图、3D 点云配准图及元数据 JSON：
+
 ```powershell
-uv run python run_experiment.py --model bracket_planar --sampler TPE --pruner Median --budget 10000 --manifest data/manifests/itoddmv_val/bop_manifest.csv --results-root results/itoddmv_val_bracket_planar_tpe_median_lexrecall_b10000_s42 --allow-query-overlap --seed 42
-uv run python run_experiment.py --model screw_black --sampler TPE --pruner Median --budget 10000 --manifest data/manifests/itoddmv_val/bop_manifest.csv --results-root results/itoddmv_val_screw_black_tpe_median_lexrecall_b10000_s42 --allow-query-overlap --seed 42
-uv run python run_experiment.py --model star --sampler TPE --pruner Median --budget 10000 --manifest data/manifests/itoddmv_val/bop_manifest.csv --results-root results/itoddmv_val_star_tpe_median_lexrecall_b10000_s42 --allow-query-overlap --seed 42
-```
-> **论文对应成果**：**Table 3.7**：《Sim-to-Real 迁移泛化性与 Real-to-Real 理论天花板性能对比表》。
+# 1.1 星形调节把手 star (全量 50 个场景批量渲染)
+uv run python visualize_results.py --model star --dataset-type native --out-dir visualizations/native_default_star --min-score 0.5
+uv run python visualize_results.py --model star --dataset-type native --storage-dir results/itodd_manual_annotated_star_tpe_median_lexrecall_b5000_s42/studies --out-dir visualizations/native_star_oracle --min-score 0.5
 
-#### 2. BOP itoddmv_val 真实场景 3D ROI 过滤定性可视化
-验证 BOP 真实场景下的 3D ROI 预处理与模型位姿估计效果（自动应用 $Z_{\max}^{\text{bop}} = +0.0360\,\text{m}$ 剔除料框桌面）：
-```powershell
-# 薄板 bracket_planar 在 BOP itoddmv_val 渲染
-uv run python visualize_results.py --model bracket_planar --dataset-type bop --out-dir visualizations/bop_default_bracket_planar
+# 1.2 黑色六角螺栓 screw_black (全量 23 个场景批量渲染)
+uv run python visualize_results.py --model screw_black --dataset-type native --out-dir visualizations/native_default_screw_black --min-score 0.01
+uv run python visualize_results.py --model screw_black --dataset-type native --storage-dir results/itodd_manual_annotated_screw_black_tpe_median_lexrecall_b5000_s42/studies --out-dir visualizations/native_screw_black_oracle --min-score 0.01
 
-# 黑色螺丝 screw_black 在 BOP itoddmv_val 渲染
-uv run python visualize_results.py --model screw_black --dataset-type bop --out-dir visualizations/bop_default_screw_black
-
-# 星形手柄 star 在 BOP itoddmv_val 渲染
-uv run python visualize_results.py --model star --dataset-type bop --out-dir visualizations/bop_default_star
+# 1.3 薄板工件 bracket_planar (全量 39 个场景批量渲染，开启剥离匹配)
+uv run python visualize_results.py --model bracket_planar --dataset-type native --out-dir visualizations/native_default_bracket_planar --min-score 0.5 --peeling
+uv run python visualize_results.py --model bracket_planar --dataset-type native --storage-dir results/itodd_manual_annotated_bracket_planar_tpe_median_lexrecall_b5000_s42/studies --out-dir visualizations/native_bracket_planar_oracle --min-score 0.5 --peeling
 ```
 
-#### 3. 原生工业场景默认基线参数可视化（不带 --storage-dir，观察 ROI 桌面剔除与基线效果）
-不指定 `--storage-dir` 时，系统自动采用官方默认超参数（`DEFAULT_PARAMS`）进行匹配，3D 视口仅渲染经过 3D ROI 截断剥离桌面后的纯工件点云（$Z_{\max}^{\text{native}} = +0.0326\,\text{m}$）：
+#### 2. 出版级 4 行 $\times$ 5 列 2D/3D 定性对比大图一键生成（600 DPI）
+自动将上述渲染生成的 4 类图件（第 1 行默认 2D 叠加、第 2 行默认 3D 点云、第 3 行优化 2D 叠加、第 4 行优化 3D 点云）等比例紧密拼装为高分辨率大图，直接输出矢量 `.pdf` 与超清 `.png` 至论文插图目录 `figures/chapter3/`：
+
 ```powershell
-# 薄板 bracket_planar 默认参数渲染（单个场景 450）
-uv run python visualize_results.py --model bracket_planar --dataset-type native --scenes "450" --out-dir visualizations/native_default_bracket_planar
+# 一键生成全部三大典型工件的 4x5 出版级高清对比图 (600 DPI，同时保存至 figures/chapter3/ 与 visualizations/comparison/)
+uv run python plotting_scripts/plot_qualitative_comparison.py --all --dpi 600
 
-# 薄板 bracket_planar 默认参数渲染（从 scene_list_bracket_planar.txt 自动批量渲染前 5 个场景）
-uv run python visualize_results.py --model bracket_planar --dataset-type native --scene-list data/base_package/models/scene_lists/scene_list_bracket_planar.txt --max-scenes 5 --out-dir visualizations/native_default_bracket_planar
-
-# 黑色螺丝 screw_black 默认参数渲染（场景 296 或批量前 5 个场景）
-uv run python visualize_results.py --model screw_black --dataset-type native --scene-list data/base_package/models/scene_lists/scene_list_screw_black.txt --max-scenes 5 --out-dir visualizations/native_default_screw_black
-
-# 星形调节手柄 star 默认参数渲染（场景 3 或批量前 5 个场景）
-uv run python visualize_results.py --model star --dataset-type native --scene-list data/base_package/models/scene_lists/scene_list_star.txt --max-scenes 5 --out-dir visualizations/native_default_star
+# 也可针对单一工件单独生成
+uv run python plotting_scripts/plot_qualitative_comparison.py --model star --dpi 600
+uv run python plotting_scripts/plot_qualitative_comparison.py --model screw_black --dpi 600
+uv run python plotting_scripts/plot_qualitative_comparison.py --model bracket_planar --dpi 600
 ```
+> **论文对应成果**：
+> - **Figure 3.8 (图件 3_4_star_compare.pdf)**：《Star 星形手柄在原生 ITODD 工业场景下默认基线与 5000 轮 HPO 优化参数的 2D 轮廓投影与 3D 点云匹配定性对比图》；
+> - **Figure 3.9 (图件 3_5_screw_compare.pdf)**：《Screw_Black 六角螺栓在原生 ITODD 工业场景下默认基线与 5000 轮 HPO 优化参数的 2D 轮廓投影与 3D 点云匹配定性对比图》；
+> - **Figure 3.10 (图件 3_6_bracket_compare.pdf)**：《Bracket_Planar 超薄钣金件在原生 ITODD 工业场景下结合点云递归剥离的 2D 轮廓投影与 3D 点云匹配定性对比图》。
 
-#### 4. 原生工业场景 HPO 最优参数 4K 满幅定性可视化（加载 1000 轮寻优结果）
-通过 `--storage-dir` 读取优化后的最佳超参数，输出 4K 超高清 2D 投影图、3D 真实纹理点云匹配图及元数据 JSON，与默认基线形成直观对比：
+#### 3. 博士论文第三章全量实验图件一键集成生成流水线
 ```powershell
-# 薄板 bracket_planar 加载最优参数渲染
-uv run python visualize_results.py --model bracket_planar --dataset-type native --storage-dir results/itoddmv_val_bracket_planar_tpe_median_lexrecall_b1000_s42/studies --scene-list data/base_package/models/scene_lists/scene_list_bracket_planar.txt --max-scenes 5 --out-dir visualizations/native_bracket_planar
-
-# 黑色螺丝 screw_black 加载最优参数渲染
-uv run python visualize_results.py --model screw_black --dataset-type native --storage-dir results/itoddmv_val_screw_black_tpe_median_lexrecall_b1000_s42/studies --scene-list data/base_package/models/scene_lists/scene_list_screw_black.txt --max-scenes 5 --out-dir visualizations/native_screw_black
-
-# 星形手柄 star 加载最优参数渲染
-uv run python visualize_results.py --model star --dataset-type native --storage-dir results/itoddmv_val_star_tpe_median_lexrecall_b1000_s42/studies --scene-list data/base_package/models/scene_lists/scene_list_star.txt --max-scenes 5 --out-dir visualizations/native_star
+# 一键自动绘制第三章全部图件 (包含 Figure 3-3 全局收敛曲线、Figure 3-4 目标函数消融、Figure 3-5 剪枝加速分析、Figure 3-6 参数敏感度分析、Figure 3-7 仿真域与真实上限对比，以及上述三大工件 4x5 定性对比大图)
+uv run python plotting_scripts/generate_all_figures.py
 ```
-> **论文对应成果**：**Figure 3.5**：《三大典型工件在原生 ITODD 工业场景下默认基线与 HPO 优化参数的 3D 点云匹配与 2D 轮廓投影定性对比图》。
 
 ---
 
@@ -208,6 +209,18 @@ uv run python summarize_results.py
 ## 5. 常用高频运维、测试与核查命令速查手册 (Quick Reference Manual)
 
 为便于日常开发、环境校验与论文实验复现，以下整理出最常用的单行快捷指令集（均为单行执行，杜绝 PowerShell 换行粘帖错误）：
+
+### 5.0 真实域点云确定性去桌面离线预处理与效果图生成速查 (Deterministic Tabletop Preprocessing & Fig 3.1)
+```powershell
+# 离线运行 RANSAC 桌面分割 (固定全局随机种子 42 + 物理尺寸距离阈值)，将 19 个真实工业场景纯工件点云固化至 points_tabletop_filtered/*.ply
+uv run python preprocess_filter_tabletop.py
+
+# 交互式查看与微调 RANSAC 桌面分割效果（支持按 [C] 一键捕获去白边高清截图）：
+uv run python visualize_ransac_tabletop.py --scene-id 8 --model star --thresh 1.0
+
+# 一键生成博士论文图 3.1（确定性 RANSAC 桌面点云分割前后对比图件 3_1_ransac_tabletop_filter.pdf / .png）：
+uv run python plotting_scripts/plot_fig1_ransac_tabletop.py
+```
 
 ### 5.1 架构与功能回归测试 (Testing & Health Check)
 ```powershell
@@ -240,39 +253,57 @@ uv run python main.py evaluate-default --bop-manifest data/manifests/itodd_scene
 uv run python main.py evaluate-default --bop-manifest data/manifests/itodd_scene0_v1/bop_manifest.csv --model screw_black --split dev --results-root results/baseline_default_scene0/screw_black --run-id eval-default-dev
 uv run python main.py evaluate-default --bop-manifest data/manifests/itodd_scene0_v1/bop_manifest.csv --model star --split dev --results-root results/baseline_default_scene0/star --run-id eval-default-dev
 
-# 真实域 Val 集默认参数评测 (ITODD-MV Val 启用 3D ROI 预处理)
-uv run python main.py evaluate-default --bop-manifest data/manifests/itoddmv_val/bop_manifest.csv --model bracket_planar --split dev --use-roi --results-root results/baseline_default_itoddmv/bracket_planar --run-id eval-default-val-roi
-uv run python main.py evaluate-default --bop-manifest data/manifests/itoddmv_val/bop_manifest.csv --model screw_black --split dev --use-roi --results-root results/baseline_default_itoddmv/screw_black --run-id eval-default-val-roi
-uv run python main.py evaluate-default --bop-manifest data/manifests/itoddmv_val/bop_manifest.csv --model star --split dev --use-roi --results-root results/baseline_default_itoddmv/star --run-id eval-default-val-roi
+# 真实域手动标注数据集默认参数评测 (自动探查并加载 points_tabletop_filtered/*.ply 固化点云)
+uv run python main.py evaluate-default --bop-manifest data/manifests/itodd_manual_annotated/bop_manifest.csv --model bracket_planar --split dev --filter-tabletop --results-root results/baseline_default_manual/bracket_planar --run-id eval-default-manual-ransac
+uv run python main.py evaluate-default --bop-manifest data/manifests/itodd_manual_annotated/bop_manifest.csv --model screw_black --split dev --filter-tabletop --results-root results/baseline_default_manual/screw_black --run-id eval-default-manual-ransac
+uv run python main.py evaluate-default --bop-manifest data/manifests/itodd_manual_annotated/bop_manifest.csv --model star --split dev --filter-tabletop --results-root results/baseline_default_manual/star --run-id eval-default-manual-ransac
 ```
 
-### 5.4 真实域 1000 轮 Real Oracle 极限寻优 (Auto 3D ROI Preprocessing)
+### 5.4 真实域 1000 轮 Real-to-Real Oracle 极限寻优 (Auto RANSAC Tabletop Removal)
 ```powershell
-# 薄板 bracket_planar 1000 轮寻优 (含 3D ROI 桌面剔除与 10 个 Checkpoints 评测)
-uv run python run_experiment.py --model bracket_planar --sampler TPE --pruner Median --budget 1000 --manifest data/manifests/itoddmv_val/bop_manifest.csv --results-root results/itoddmv_val_bracket_planar_tpe_median_lexrecall_b1000_s42 --allow-query-overlap --seed 42
+# 薄板 bracket_planar 1000 轮寻优 (含确定性去桌面与 10 个 Checkpoints 评测)
+uv run python run_experiment.py --model bracket_planar --sampler TPE --pruner Median --budget 1000 --manifest data/manifests/itodd_manual_annotated/bop_manifest.csv --results-root results/itodd_manual_annotated_bracket_planar_tpe_median_lexrecall_b1000_s42 --allow-query-overlap --seed 42
 
 # 黑色螺丝 screw_black 1000 轮寻优
-uv run python run_experiment.py --model screw_black --sampler TPE --pruner Median --budget 1000 --manifest data/manifests/itoddmv_val/bop_manifest.csv --results-root results/itoddmv_val_screw_black_tpe_median_lexrecall_b1000_s42 --allow-query-overlap --seed 42
+uv run python run_experiment.py --model screw_black --sampler TPE --pruner Median --budget 1000 --manifest data/manifests/itodd_manual_annotated/bop_manifest.csv --results-root results/itodd_manual_annotated_screw_black_tpe_median_lexrecall_b1000_s42 --allow-query-overlap --seed 42
 
 # 星形调节把手 star 1000 轮寻优
-uv run python run_experiment.py --model star --sampler TPE --pruner Median --budget 1000 --manifest data/manifests/itoddmv_val/bop_manifest.csv --results-root results/itoddmv_val_star_tpe_median_lexrecall_b1000_s42 --allow-query-overlap --seed 42
+uv run python run_experiment.py --model star --sampler TPE --pruner Median --budget 1000 --manifest data/manifests/itodd_manual_annotated/bop_manifest.csv --results-root results/itodd_manual_annotated_star_tpe_median_lexrecall_b1000_s42 --allow-query-overlap --seed 42
 ```
 
-### 5.5 论文 4K 超高清定性可视化渲染速查 (Visualizations)
+### 5.5 论文 4K 超高清定性可视化全量场景批量渲染速查 (Visualizations)
 ```powershell
-# 1. BOP 真实域默认参数渲染 (带 3D ROI 滤波)
-uv run python visualize_results.py --model bracket_planar --dataset-type bop --out-dir visualizations/bop_default_bracket_planar
-uv run python visualize_results.py --model screw_black --dataset-type bop --out-dir visualizations/bop_default_screw_black
-uv run python visualize_results.py --model star --dataset-type bop --out-dir visualizations/bop_default_star
+# 1. 原生工业场景默认参数全量批量渲染 (自动加载对应模型 scene_list_<model>.txt 的全部场景)
+uv run python visualize_results.py --model star --dataset-type native --out-dir visualizations/native_default_star --min-score 0.5
+uv run python visualize_results.py --model screw_black --dataset-type native --out-dir visualizations/native_default_screw_black --min-score 0.01
+uv run python visualize_results.py --model bracket_planar --dataset-type native --out-dir visualizations/native_default_bracket_planar --min-score 0.5 --peeling
 
-# 2. 原生工业场景默认参数批量渲染 (带 3D ROI 滤波，每工件前 5 场景)
-uv run python visualize_results.py --model bracket_planar --dataset-type native --scene-list data/base_package/models/scene_lists/scene_list_bracket_planar.txt --max-scenes 5 --out-dir visualizations/native_default_bracket_planar
-uv run python visualize_results.py --model screw_black --dataset-type native --scene-list data/base_package/models/scene_lists/scene_list_screw_black.txt --max-scenes 5 --out-dir visualizations/native_default_screw_black
-uv run python visualize_results.py --model star --dataset-type native --scene-list data/base_package/models/scene_lists/scene_list_star.txt --max-scenes 5 --out-dir visualizations/native_default_star
-
-# 3. 原生工业场景加载 HPO 最优参数渲染 (每工件前 5 场景)
-uv run python visualize_results.py --model bracket_planar --dataset-type native --storage-dir results/itoddmv_val_bracket_planar_tpe_median_lexrecall_b1000_s42/studies --scene-list data/base_package/models/scene_lists/scene_list_bracket_planar.txt --max-scenes 5 --out-dir visualizations/native_bracket_planar
-uv run python visualize_results.py --model screw_black --dataset-type native --storage-dir results/itoddmv_val_screw_black_tpe_median_lexrecall_b1000_s42/studies --scene-list data/base_package/models/scene_lists/scene_list_screw_black.txt --max-scenes 5 --out-dir visualizations/native_screw_black
-uv run python visualize_results.py --model star --dataset-type native --storage-dir results/itoddmv_val_star_tpe_median_lexrecall_b1000_s42/studies --scene-list data/base_package/models/scene_lists/scene_list_star.txt --max-scenes 5 --out-dir visualizations/native_star
+# 2. 原生工业场景加载 Real Oracle 5000 轮最优参数全量批量渲染 (自动从 b5000 数据库读取最优参数)
+uv run python visualize_results.py --model star --dataset-type native --storage-dir results/itodd_manual_annotated_star_tpe_median_lexrecall_b5000_s42/studies --out-dir visualizations/native_star_oracle --min-score 0.5
+uv run python visualize_results.py --model screw_black --dataset-type native --storage-dir results/itodd_manual_annotated_screw_black_tpe_median_lexrecall_b5000_s42/studies --out-dir visualizations/native_screw_black_oracle --min-score 0.01
+uv run python visualize_results.py --model bracket_planar --dataset-type native --storage-dir results/itodd_manual_annotated_bracket_planar_tpe_median_lexrecall_b5000_s42/studies --out-dir visualizations/native_bracket_planar_oracle --min-score 0.5 --peeling
 ```
 
+### 5.6 论文定性对比大图与全章图件出版级生成速查 (Publication Figures)
+```powershell
+# 1. 出版级 4行x5列 2D/3D 定性对比大图一键生成 (600 DPI，生成至 figures/chapter3/ 与 visualizations/comparison/)
+# 从项目子目录 code/hpo-3d-match/ 运行:
+uv run python plotting_scripts/plot_qualitative_comparison.py --all --dpi 600
+
+# 若从论文根目录 graduate-thesis/ 运行:
+uv run python code/hpo-3d-match/plotting_scripts/plot_qualitative_comparison.py --all --dpi 600
+
+# 2. 博士论文第三章全量实验图件一键集成生成流水线 (生成 Figure 3-3 至 3-7 全部插图与对比大图)
+# 从项目子目录 code/hpo-3d-match/ 运行:
+uv run python plotting_scripts/generate_all_figures.py
+
+# 若从论文根目录 graduate-thesis/ 运行:
+uv run python code/hpo-3d-match/plotting_scripts/generate_all_figures.py
+```
+
+---
+
+### 真实域手动标注数据集场景全量覆盖明细 (共 19 个真实工业场景):
+- **`star`** (7 个场景): 8, 10, 13, 164, 749 (手动标定场景) + 0, 3 (转换对齐场景)
+- **`bracket_planar`** (7 个场景): 456, 461, 481, 476, 488 (手动标定场景) + 450, 468 (转换对齐场景)
+- **`screw_black`** (5 个场景): 299, 302, 305 (手动标定场景) + 293, 296 (转换对齐场景)

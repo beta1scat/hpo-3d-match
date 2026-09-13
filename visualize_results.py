@@ -17,6 +17,7 @@ import argparse
 import copy
 import json
 import os
+import re
 import sys
 import time
 from pathlib import Path
@@ -36,43 +37,50 @@ from bop_scene_loader import (
     read_bop_camera,
     read_depth_image,
 )
-from config import DEFAULT_PARAMS, ROIConfig, TARGET_OBJECT_IDS
+from config import DEFAULT_PARAMS, RANSAC_TABLETOP_THRESHOLDS, TARGET_OBJECT_IDS
 from dataset import ITODD_EXTERNAL_MANIFEST_FIELDS, TARGET_CAD_FILES
 from external_pipeline import (
     load_original_cad,
     load_xyz_point_cloud,
     read_external_queries,
-    transform_roi_pose_to_scene,
 )
 from matcher import MatchError, SurfaceMatcher
 from pipeline import _load_model, surface_matching_config
-from scene_loader import compute_roi_transform, filter_scene_roi
 
 
 def get_best_params_from_study(storage_dir: Path, model_name: str) -> dict[str, Any]:
-    """Read the best parameter set from an Optuna study DB or JSONL."""
+    """Read the best parameter set from an Optuna study DB."""
     import optuna
 
-    db_path = storage_dir / f"{model_name}.db"
-    if db_path.exists():
-        try:
-            storage_url = f"sqlite:///{db_path.resolve()}"
-            studies = optuna.get_all_study_summaries(storage=storage_url)
-            if studies:
-                study = optuna.load_study(storage=storage_url, study_name=studies[0].study_name)
-                print(f"[+] Loaded best params from Optuna study: {study.study_name} (Value: {study.best_value})")
-                return study.best_params
-        except Exception as exc:
-            print(f"[!] Warning reading Optuna DB: {exc}")
+    resolved_dir = storage_dir.resolve()
+    if not resolved_dir.is_dir():
+        alt = (Path(__file__).parent / storage_dir).resolve()
+        if alt.is_dir():
+            resolved_dir = alt
+        else:
+            raise FileNotFoundError(
+                f"Specified --storage-dir does not exist: {storage_dir} (tried {resolved_dir} and {alt})"
+            )
 
-    # Fallback: check jsonl studies
-    jsonl_files = list(storage_dir.glob("*.jsonl"))
-    if jsonl_files:
-        best_file = max(jsonl_files, key=os.path.getctime)
-        print(f"[+] Reading params from journal: {best_file.name}")
-        # Return DEFAULT_PARAMS if parsing jsonl is not needed
-    print("[*] Using default parameters.")
-    return dict(DEFAULT_PARAMS)
+    db_path = resolved_dir / f"{model_name}.db"
+    if not db_path.is_file():
+        studies_sub = resolved_dir / "studies" / f"{model_name}.db"
+        if studies_sub.is_file():
+            db_path = studies_sub
+        else:
+            raise FileNotFoundError(
+                f"Optuna database '{model_name}.db' not found in {resolved_dir} or {resolved_dir / 'studies'}"
+            )
+
+    storage_url = f"sqlite:///{db_path.resolve()}"
+    studies = optuna.get_all_study_summaries(storage=storage_url)
+    if not studies:
+        raise ValueError(f"No studies found in Optuna database: {db_path}")
+
+    study = optuna.load_study(storage=storage_url, study_name=studies[0].study_name)
+    print(f"[+] Loaded best params from Optuna study: {study.study_name} (Value: {study.best_value:.2f})")
+    print(f"    Best params: {study.best_params}")
+    return dict(study.best_params)
 
 
 def project_points(pts_3d_m: np.ndarray, cam_k: np.ndarray) -> np.ndarray:
@@ -146,15 +154,22 @@ def render_3d_pointcloud(
     out_path: Path,
     scene_colors: np.ndarray | None = None,
     peeled_points_list: list[np.ndarray] | None = None,
+    camera_json_path: Path | None = None,
 ) -> None:
-    """Render 3D point cloud with textured sensor points and CAD models in 3D perspective."""
+    """Render 3D point cloud in millimeter space matching visualize_annotation.py standard."""
+    pts_arr = np.asarray(scene_points_m, dtype=np.float64)
+    # Convert to millimeters if scene points are in meters (max coordinate < 20.0)
+    pts_mm = pts_arr * 1000.0 if pts_arr.size > 0 and np.max(np.abs(pts_arr)) < 20.0 else pts_arr
+
     pcd = o3d.geometry.PointCloud()
-    pcd.points = o3d.utility.Vector3dVector(scene_points_m)
-    
-    if scene_colors is not None and len(scene_colors) == len(scene_points_m):
+    pcd.points = o3d.utility.Vector3dVector(pts_mm)
+    if len(pts_mm) > 0:
+        pcd.estimate_normals(search_param=o3d.geometry.KDTreeSearchParamHybrid(radius=10.0, max_nn=30))
+
+    if scene_colors is not None and len(scene_colors) == len(pts_mm):
         pcd.colors = o3d.utility.Vector3dVector(scene_colors)
     else:
-        pcd.paint_uniform_color([0.35, 0.38, 0.45])
+        pcd.paint_uniform_color([0.65, 0.70, 0.75])
 
     vis_geoms = [pcd]
     colors = [
@@ -165,12 +180,27 @@ def render_3d_pointcloud(
         [0.2, 0.95, 0.9],    # Bright Cyan
     ]
 
+    # Ensure cad_mesh template is in millimeter scale
+    mesh_template = copy.deepcopy(cad_mesh)
+    verts = np.asarray(mesh_template.vertices)
+    if len(verts) > 0 and np.max(np.abs(verts)) < 5.0:
+        mesh_template.scale(1000.0, center=(0, 0, 0))
+
     for idx, pose in enumerate(poses):
-        inst_mesh = copy.deepcopy(cad_mesh)
-        inst_mesh.transform(pose)
-        inst_mesh.compute_vertex_normals()  # 3D shading highlights
+        inst_mesh = copy.deepcopy(mesh_template)
+        T = np.array(pose, dtype=np.float64, copy=True)
+        # If translation in meters, scale to mm
+        if np.max(np.abs(T[:3, 3])) < 20.0:
+            T[:3, 3] *= 1000.0
+        inst_mesh.transform(T)
+        inst_mesh.compute_vertex_normals()
         inst_mesh.paint_uniform_color(colors[idx % len(colors)])
         vis_geoms.append(inst_mesh)
+
+        # Local coordinate axis at object origin (size: 35.0 mm, matching visualize_annotation.py)
+        frame = o3d.geometry.TriangleMesh.create_coordinate_frame(size=35.0, origin=[0, 0, 0])
+        frame.transform(T)
+        vis_geoms.append(frame)
 
     # If peeling progression layers are provided, render them with distinct progression colors
     if peeled_points_list:
@@ -183,60 +213,73 @@ def render_3d_pointcloud(
         ]
         for idx, peeled_pts in enumerate(peeled_points_list):
             if len(peeled_pts) > 0:
+                p_arr = np.asarray(peeled_pts, dtype=np.float64)
+                p_mm = p_arr * 1000.0 if np.max(np.abs(p_arr)) < 20.0 else p_arr
                 p_pcd = o3d.geometry.PointCloud()
-                p_pcd.points = o3d.utility.Vector3dVector(peeled_pts)
+                p_pcd.points = o3d.utility.Vector3dVector(p_mm)
                 p_pcd.paint_uniform_color(peel_palette[idx % len(peel_palette)])
                 vis_geoms.append(p_pcd)
 
     vis = o3d.visualization.Visualizer()
-    # 4K Ultra-HD resolution buffer
-    vis.create_window(visible=False, width=3840, height=2160)
+    win_w, win_h = 1600, 950
+    vis.create_window(visible=False, width=win_w, height=win_h)
     for g in vis_geoms:
         vis.add_geometry(g)
 
     # Render options for publication quality
     opt = vis.get_render_option()
-    opt.background_color = np.asarray([0.99, 0.99, 0.99])  # Clean white background
-    opt.point_size = 2.8
+    opt.background_color = np.asarray([1.0, 1.0, 1.0])  # Pure white background
+    opt.point_size = 3.0
     opt.light_on = True
 
-    # Elevated 3D oblique perspective: global bounding box focus
     ctr = vis.get_view_control()
-    min_b = pcd.get_min_bound()
-    max_b = pcd.get_max_bound()
-    for g in vis_geoms[1:]:
-        min_b = np.minimum(min_b, g.get_min_bound())
-        max_b = np.maximum(max_b, g.get_max_bound())
-    global_center = (min_b + max_b) / 2.0
+    has_custom_camera = False
+    if camera_json_path is not None and Path(camera_json_path).exists():
+        try:
+            param = o3d.io.read_pinhole_camera_parameters(str(camera_json_path))
+            ctr.convert_from_pinhole_camera_parameters(param, allow_arbitrary=True)
+            has_custom_camera = True
+        except Exception as e:
+            print(f"[!] Warning: Failed to apply camera JSON {camera_json_path}: {e}")
 
-    ctr.set_lookat(global_center)
-    ctr.set_front([0.32, -0.42, -0.85])
-    ctr.set_up([0.12, -0.90, 0.42])
-    ctr.set_zoom(0.58)  # Optimal zoom ensuring full containment without clipping
-    
+    if not has_custom_camera:
+        # Fallback to elevated 3D oblique perspective: global bounding box focus
+        min_b = pcd.get_min_bound()
+        max_b = pcd.get_max_bound()
+        for g in vis_geoms[1:]:
+            min_b = np.minimum(min_b, g.get_min_bound())
+            max_b = np.maximum(max_b, g.get_max_bound())
+        global_center = (min_b + max_b) / 2.0
+
+        ctr.set_lookat(global_center)
+        ctr.set_front([0.32, -0.42, -0.85])
+        ctr.set_up([0.12, -0.90, 0.42])
+        ctr.set_zoom(0.58)
+
     vis.poll_events()
     vis.update_renderer()
     out_path.parent.mkdir(parents=True, exist_ok=True)
     vis.capture_screen_image(str(out_path))
     vis.destroy_window()
 
-    # Auto-crop surrounding blank white margins with safe padding
-    img_bgr = cv2.imread(str(out_path))
-    if img_bgr is not None:
-        gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
-        mask = gray < 248
-        coords = cv2.findNonZero(mask.astype(np.uint8))
-        if coords is not None:
-            x, y, w, h = cv2.boundingRect(coords)
-            pad = 50
-            x1 = max(0, x - pad)
-            y1 = max(0, y - pad)
-            x2 = min(img_bgr.shape[1], x + w + pad)
-            y2 = min(img_bgr.shape[0], y + h + pad)
-            cropped = img_bgr[y1:y2, x1:x2]
-            cv2.imwrite(str(out_path), cropped)
+    # Option A: When using fixed camera JSON, do NOT auto-crop so framing is strictly preserved
+    if not has_custom_camera:
+        img_bgr = cv2.imread(str(out_path))
+        if img_bgr is not None:
+            gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
+            mask = gray < 250
+            coords = cv2.findNonZero(mask.astype(np.uint8))
+            if coords is not None:
+                x, y, w, h = cv2.boundingRect(coords)
+                pad = 50
+                x1 = max(0, x - pad)
+                y1 = max(0, y - pad)
+                x2 = min(img_bgr.shape[1], x + w + pad)
+                y2 = min(img_bgr.shape[0], y + h + pad)
+                cropped = img_bgr[y1:y2, x1:x2]
+                cv2.imwrite(str(out_path), cropped)
 
-    print(f"[+] Saved 4K Ultra-HD 3D point cloud visualization to {out_path}")
+    print(f"[+] Saved 3D point cloud visualization to {out_path}")
 
 
 def sequential_subtraction_matching(
@@ -247,7 +290,6 @@ def sequential_subtraction_matching(
     min_score: float = 0.50,
     subtraction_radius: float = 0.005,
     max_iterations: int = 10,
-    roi_transform_mat: np.ndarray | None = None,
     interactive: bool = False,
 ) -> tuple[list[np.ndarray], list[float], list[dict[str, Any]], list[np.ndarray]]:
     """Execute recursive single-instance matching and spatial point subtraction (Route A).
@@ -260,7 +302,6 @@ def sequential_subtraction_matching(
         min_score: Minimum matching and convergence threshold; stops when best match score < min_score
         subtraction_radius: Distance threshold (metres) to peel away points around matched CAD
         max_iterations: Safety ceiling on iterations
-        roi_transform_mat: Optional 4x4 ROI matrix for Native pipeline back-projection
         interactive: If True, opens Open3D GUI window at each step (press 'q' to proceed)
 
     Returns:
@@ -333,9 +374,6 @@ def sequential_subtraction_matching(
         mat = np.eye(4, dtype=np.float64)
         mat[:3, :3] = best_pred.rotation
         mat[:3, 3] = best_pred.translation_mm / 1000.0
-
-        if roi_transform_mat is not None:
-            mat = roi_transform_mat @ mat
 
         detected_poses.append(mat)
         detected_scores.append(best_score)
@@ -454,6 +492,7 @@ def visualize_bop_scene(
     min_score: float = 0.50,
     subtraction_radius: float = 0.005,
     max_iterations: int = 10,
+    camera_json_path: Path | None = None,
 ) -> None:
     """Run matching and visualization on a BOP dataset scene (e.g. itoddmv_val)."""
     print(f"\n==================== [BOP Scene] Model: {model_name} | Scene: {scene_id} | Image: {image_id} ====================")
@@ -485,7 +524,7 @@ def visualize_bop_scene(
     img_norm = (img_norm - img_norm.min()) / (img_norm.max() - img_norm.min() + 1e-6)
     pt_gray = img_norm[rows, columns]
     # Realistic industrial sensor monochrome point tint
-    point_colors = np.column_stack([pt_gray * 0.70, pt_gray * 0.75, pt_gray * 0.82])
+    point_colors = np.column_stack([pt_gray, pt_gray, pt_gray])
 
     # CAD mesh for Open3D
     cad_mesh = o3d.io.read_triangle_mesh(str(cad_path))
@@ -493,22 +532,20 @@ def visualize_bop_scene(
     if np.asarray(cad_mesh.vertices).max() > 10.0:  # If in mm, convert to metres
         cad_mesh.scale(0.001, center=(0, 0, 0))
 
-    # 3D ROI Box Filter (strip tabletop and background points in camera frame)
-    roi = ROIConfig()
-    roi_mat = np.array(roi.matrix, dtype=np.float64)
-    inv_roi_mat = np.linalg.inv(roi_mat)
-    pts_h = np.column_stack([points_xyz_m, np.ones(len(points_xyz_m))])
-    pts_roi = (inv_roi_mat @ pts_h.T).T[:, :3]
-    in_roi = (
-        (pts_roi[:, 0] >= roi.x_range[0])
-        & (pts_roi[:, 0] <= roi.x_range[1])
-        & (pts_roi[:, 1] >= roi.y_range[0])
-        & (pts_roi[:, 1] <= roi.y_range[1])
-        & (pts_roi[:, 2] >= roi.z_range[0])
-        & (pts_roi[:, 2] <= roi.z_range[1])
-    )
+    # Tabletop RANSAC plane removal
+    if not show_full_scene:
+        from bop_scene_loader import filter_points_ransac_tabletop
 
-    match_pts = points_xyz_m if show_full_scene else points_xyz_m[in_roi]
+        thresh = RANSAC_TABLETOP_THRESHOLDS.get(model_name, 0.0020)
+        match_pts, non_table_mask = filter_points_ransac_tabletop(
+            points_xyz_m, distance_threshold_m=thresh, return_mask=True
+        )
+        render_pts = match_pts
+        render_colors = point_colors[non_table_mask]
+    else:
+        match_pts = points_xyz_m
+        render_pts = points_xyz_m
+        render_colors = point_colors
     halcon_model = _load_model(cad_path, "mm")
 
     if sequential_subtraction:
@@ -525,11 +562,9 @@ def visualize_bop_scene(
 
         prefix = f"seq_sub_bop_{model_name}_s{scene_id}_im{image_id}"
         render_2d_overlay(img_2d, cad_mesh, poses_4x4, camera.intrinsic_matrix, out_dir / f"{prefix}_2d_overlay.png", scores)
-        render_pts = points_xyz_m if show_full_scene else points_xyz_m[in_roi]
-        render_colors = point_colors if show_full_scene else point_colors[in_roi]
-        render_3d_pointcloud(render_pts, cad_mesh, poses_4x4, out_dir / f"{prefix}_3d_pointcloud.png", scene_colors=render_colors)
-        render_3d_pointcloud(points_xyz_m, cad_mesh, poses_4x4, out_dir / f"{prefix}_3d_raw_pointcloud.png", scene_colors=point_colors)
-        render_3d_pointcloud(render_pts, cad_mesh, poses_4x4, out_dir / f"{prefix}_3d_peeling_progression.png", peeled_points_list=peeled_layers)
+        render_3d_pointcloud(render_pts, cad_mesh, poses_4x4, out_dir / f"{prefix}_3d_pointcloud.png", scene_colors=render_colors, camera_json_path=camera_json_path)
+        render_3d_pointcloud(points_xyz_m, cad_mesh, poses_4x4, out_dir / f"{prefix}_3d_raw_pointcloud.png", scene_colors=point_colors, camera_json_path=camera_json_path)
+        render_3d_pointcloud(render_pts, cad_mesh, poses_4x4, out_dir / f"{prefix}_3d_peeling_progression.png", peeled_points_list=peeled_layers, camera_json_path=camera_json_path)
 
         meta = {
             "pipeline": "sequential_subtraction",
@@ -569,10 +604,8 @@ def visualize_bop_scene(
     # Render 2D & 3D
     prefix = f"bop_{model_name}_s{scene_id}_im{image_id}"
     render_2d_overlay(img_2d, cad_mesh, poses_4x4, camera.intrinsic_matrix, out_dir / f"{prefix}_2d_overlay.png", match_res.scores)
-    render_pts = points_xyz_m if show_full_scene else points_xyz_m[in_roi]
-    render_colors = point_colors if show_full_scene else point_colors[in_roi]
-    render_3d_pointcloud(render_pts, cad_mesh, poses_4x4, out_dir / f"{prefix}_3d_pointcloud.png", scene_colors=render_colors)
-    render_3d_pointcloud(points_xyz_m, cad_mesh, poses_4x4, out_dir / f"{prefix}_3d_raw_pointcloud.png", scene_colors=point_colors)
+    render_3d_pointcloud(render_pts, cad_mesh, poses_4x4, out_dir / f"{prefix}_3d_pointcloud.png", scene_colors=render_colors, camera_json_path=camera_json_path)
+    render_3d_pointcloud(points_xyz_m, cad_mesh, poses_4x4, out_dir / f"{prefix}_3d_raw_pointcloud.png", scene_colors=point_colors, camera_json_path=camera_json_path)
 
     # Save metadata JSON
     meta = {
@@ -602,6 +635,7 @@ def visualize_native_scene(
     min_score: float = 0.50,
     subtraction_radius: float = 0.005,
     max_iterations: int = 10,
+    camera_json_path: Path | None = None,
 ) -> None:
     """Run matching and visualization on an ITODD Native scene (data/3d_long_baseline)."""
     print(f"\n==================== [ITODD Native Scene] Model: {model_name} | Scene: {scene_id} ====================")
@@ -628,21 +662,22 @@ def visualize_native_scene(
     
     l_img = np.asarray(img_2d)[valid][::stride].astype(np.float64)
     l_norm = (l_img - l_img.min()) / (l_img.max() - l_img.min() + 1e-6)
-    point_colors = np.column_stack([l_norm * 0.70, l_norm * 0.75, l_norm * 0.82])
+    point_colors = np.column_stack([l_norm, l_norm, l_norm])
 
-    # HALCON matching with ROI
-    roi = ROIConfig()
-    roi_mat, roi_pose_inv = compute_roi_transform(roi)
+    # Tabletop RANSAC plane removal
+    if not show_full_scene:
+        from bop_scene_loader import filter_points_ransac_tabletop
 
-    # Filter 3D points by ROI in camera frame
-    inv_roi_mat = np.linalg.inv(roi_mat)
-    pts_h = np.column_stack([points_xyz_m, np.ones(len(points_xyz_m))])
-    pts_roi = (inv_roi_mat @ pts_h.T).T[:, :3]
-    in_roi = (
-        (pts_roi[:, 0] >= roi.x_range[0]) & (pts_roi[:, 0] <= roi.x_range[1]) &
-        (pts_roi[:, 1] >= roi.y_range[0]) & (pts_roi[:, 1] <= roi.y_range[1]) &
-        (pts_roi[:, 2] >= roi.z_range[0]) & (pts_roi[:, 2] <= roi.z_range[1])
-    )
+        thresh = RANSAC_TABLETOP_THRESHOLDS.get(model_name, 0.0020)
+        filtered_scene_pts, non_table_mask = filter_points_ransac_tabletop(
+            points_xyz_m, distance_threshold_m=thresh, return_mask=True
+        )
+        render_pts = filtered_scene_pts
+        render_colors = point_colors[non_table_mask]
+    else:
+        filtered_scene_pts = points_xyz_m
+        render_pts = points_xyz_m
+        render_colors = point_colors
 
     # CAD mesh for Open3D
     cad_mesh = o3d.io.read_triangle_mesh(str(cad_path))
@@ -656,7 +691,7 @@ def visualize_native_scene(
     model_point_cloud = load_original_cad(cad_path)
 
     if sequential_subtraction:
-        init_pts = points_xyz_m if show_full_scene else points_xyz_m[in_roi]
+        init_pts = filtered_scene_pts
         poses_4x4, scores, history, peeled_layers = sequential_subtraction_matching(
             model_point_cloud_halcon=model_point_cloud,
             cad_mesh_o3d=cad_mesh,
@@ -670,11 +705,9 @@ def visualize_native_scene(
 
         prefix = f"seq_sub_native_{model_name}_scene{scene_id:04d}"
         render_2d_overlay(img_2d, cad_mesh, poses_4x4, cam_k, out_dir / f"{prefix}_2d_overlay.png", scores)
-        render_pts = points_xyz_m if show_full_scene else points_xyz_m[in_roi]
-        render_colors = point_colors if show_full_scene else point_colors[in_roi]
-        render_3d_pointcloud(render_pts, cad_mesh, poses_4x4, out_dir / f"{prefix}_3d_pointcloud.png", scene_colors=render_colors)
-        render_3d_pointcloud(points_xyz_m, cad_mesh, poses_4x4, out_dir / f"{prefix}_3d_raw_pointcloud.png", scene_colors=point_colors)
-        render_3d_pointcloud(render_pts, cad_mesh, poses_4x4, out_dir / f"{prefix}_3d_peeling_progression.png", peeled_points_list=peeled_layers)
+        render_3d_pointcloud(render_pts, cad_mesh, poses_4x4, out_dir / f"{prefix}_3d_pointcloud.png", scene_colors=render_colors, camera_json_path=camera_json_path)
+        render_3d_pointcloud(points_xyz_m, cad_mesh, poses_4x4, out_dir / f"{prefix}_3d_raw_pointcloud.png", scene_colors=point_colors, camera_json_path=camera_json_path)
+        render_3d_pointcloud(render_pts, cad_mesh, poses_4x4, out_dir / f"{prefix}_3d_peeling_progression.png", peeled_points_list=peeled_layers, camera_json_path=camera_json_path)
 
         meta = {
             "pipeline": "sequential_subtraction",
@@ -693,20 +726,20 @@ def visualize_native_scene(
         print(f"[+] Saved sequential subtraction metadata to {out_dir / f'{prefix}_meta.json'}")
         return
 
-    # Standard one-shot HALCON matching with ROI
-    images = [ha.read_image(str(x_path)), ha.read_image(str(y_path)), ha.read_image(str(z_path))]
-    scene_3d = ha.xyz_to_object_model_3d(*images)
-    scene_roi = filter_scene_roi(scene_3d, roi_pose_inv, roi)
+    # Standard one-shot HALCON matching with RANSAC tabletop removal
+    from bop_scene_loader import create_halcon_point_cloud
 
-    config = surface_matching_config(params, timeout_sec=5.0, min_score=min_score, num_matches=10)
+    scene_3d = create_halcon_point_cloud(filtered_scene_pts)
+
+    config = surface_matching_config(
+        params, timeout_sec=5.0, min_score=min_score, num_matches=10
+    )
 
     with SurfaceMatcher(model_point_cloud, config) as matcher:
-        match_res = matcher.match(scene_roi)
+        match_res = matcher.match(scene_3d)
 
-    predictions = tuple(
-        transform_roi_pose_to_scene(pose, roi_mat) for pose in match_res.predictions
-    )
-    
+    predictions = match_res.predictions
+
     poses_4x4 = []
     for pred in predictions:
         mat = np.eye(4)
@@ -716,13 +749,31 @@ def visualize_native_scene(
 
     print(f"[*] Found {len(poses_4x4)} matches in {match_res.runtime_ms:.1f}ms")
 
-    render_pts = points_xyz_m if show_full_scene else points_xyz_m[in_roi]
-    render_colors = point_colors if show_full_scene else point_colors[in_roi]
-
     prefix = f"native_{model_name}_scene{scene_id:04d}"
-    render_2d_overlay(img_2d, cad_mesh, poses_4x4, cam_k, out_dir / f"{prefix}_2d_overlay.png", match_res.scores)
-    render_3d_pointcloud(render_pts, cad_mesh, poses_4x4, out_dir / f"{prefix}_3d_pointcloud.png", scene_colors=render_colors)
-    render_3d_pointcloud(points_xyz_m, cad_mesh, poses_4x4, out_dir / f"{prefix}_3d_raw_pointcloud.png", scene_colors=point_colors)
+    render_2d_overlay(
+        img_2d,
+        cad_mesh,
+        poses_4x4,
+        cam_k,
+        out_dir / f"{prefix}_2d_overlay.png",
+        match_res.scores,
+    )
+    render_3d_pointcloud(
+        render_pts,
+        cad_mesh,
+        poses_4x4,
+        out_dir / f"{prefix}_3d_pointcloud.png",
+        scene_colors=render_colors,
+        camera_json_path=camera_json_path,
+    )
+    render_3d_pointcloud(
+        points_xyz_m,
+        cad_mesh,
+        poses_4x4,
+        out_dir / f"{prefix}_3d_raw_pointcloud.png",
+        scene_colors=point_colors,
+        camera_json_path=camera_json_path,
+    )
 
     meta = {
         "dataset": "itodd_native_3d_long_baseline",
@@ -735,7 +786,7 @@ def visualize_native_scene(
         "params": params,
     }
     (out_dir / f"{prefix}_meta.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
-    print(f"[+] Saved metadata to {out_dir / f'{prefix}_meta.json'}")
+    print(f"[+] Saved visualization metadata to {out_dir / f'{prefix}_meta.json'}")
 
 
 def load_scene_ids_from_file(file_path: Path) -> list[int]:
@@ -746,11 +797,36 @@ def load_scene_ids_from_file(file_path: Path) -> list[int]:
             line = line.strip()
             if not line or line.startswith("#"):
                 continue
-            try:
-                scene_ids.append(int(line))
-            except ValueError:
-                continue
+            match = re.search(r"scene_(\d+)", line)
+            if match:
+                scene_ids.append(int(match.group(1)))
+            else:
+                try:
+                    scene_ids.append(int(line))
+                except ValueError:
+                    continue
     return scene_ids
+
+
+def resolve_camera_json(camera_path: Path | None) -> Path | None:
+    """Resolve Open3D camera parameter JSON file path across common working directories."""
+    if camera_path is not None:
+        if camera_path.exists():
+            return camera_path
+        alt = Path(__file__).parent / camera_path
+        if alt.exists():
+            return alt
+        return camera_path
+
+    candidates = [
+        Path.cwd() / "ScreenCamera_2026-09-05-17-46-04.json",
+        Path(__file__).parent / "ScreenCamera_2026-09-05-17-46-04.json",
+        Path("code/hpo-3d-match/ScreenCamera_2026-09-05-17-46-04.json"),
+    ]
+    for c in candidates:
+        if c.exists():
+            return c
+    return None
 
 
 def main() -> int:
@@ -760,14 +836,20 @@ def main() -> int:
     parser.add_argument("--storage-dir", type=Path, help="Directory containing study .db to extract optimal parameters")
     parser.add_argument("--scene-list", type=Path, help="Path to scene list text file (default: data/base_package/models/scene_lists/scene_list_<model>.txt)")
     parser.add_argument("--scenes", type=str, help="Explicit comma-separated scene IDs to visualize (overrides --scene-list)")
-    parser.add_argument("--max-scenes", type=int, default=5, help="Max scenes to process from list (default: 5, set <=0 for all)")
-    parser.add_argument("--show-full-scene", action="store_true", help="Render uncropped full scene point cloud instead of cropped ROI")
+    parser.add_argument("--max-scenes", type=int, default=0, help="Max scenes to process from list (default: 0 for all scenes, set >0 to limit)")
+    parser.add_argument("--show-full-scene", action="store_true", help="Render full scene point cloud instead of tabletop-filtered scene")
     parser.add_argument("--out-dir", type=Path, default=Path("visualizations/results"))
     parser.add_argument("--sequential-subtraction", "--peeling", dest="sequential_subtraction", action="store_true", default=False, help="Enable recursive point cloud subtraction matching")
     parser.add_argument("--interactive", dest="interactive", action="store_true", default=False, help="Enable step-by-step Open3D interactive visualization (press 'q' to proceed)")
     parser.add_argument("--min-score", type=float, default=None, help="Minimum matching score threshold (default: study params or 0.50 for sequential subtraction, 0.01 for standard)")
     parser.add_argument("--subtraction-radius", type=float, default=0.005, help="Point cloud peeling radius in metres (default: 0.005 = 5mm)")
     parser.add_argument("--max-iterations", type=int, default=10, help="Maximum iterations per scene for sequential subtraction (default: 10)")
+    parser.add_argument(
+        "--camera-json",
+        type=Path,
+        default=None,
+        help="Path to Open3D camera parameter JSON (default: ScreenCamera_2026-09-05-17-46-04.json if found)",
+    )
     args = parser.parse_args()
 
     args.out_dir.mkdir(parents=True, exist_ok=True)
@@ -780,6 +862,13 @@ def main() -> int:
         default_val = 0.50 if args.sequential_subtraction else 0.01
         min_score = float(params.get("min_score", default_val))
         params["min_score"] = min_score
+
+    camera_json_path = resolve_camera_json(args.camera_json)
+    if camera_json_path and camera_json_path.exists():
+        print(f"[+] Using camera viewpoint parameters from: {camera_json_path}")
+    else:
+        if args.camera_json is not None:
+            print(f"[!] Warning: Specified camera JSON not found: {args.camera_json}")
 
     if args.dataset_type == "native":
         if args.scenes:
@@ -807,6 +896,7 @@ def main() -> int:
                     min_score=min_score,
                     subtraction_radius=args.subtraction_radius,
                     max_iterations=args.max_iterations,
+                    camera_json_path=camera_json_path,
                 )
             except Exception as e:
                 print(f"[!] Error processing native scene {scene_id}: {e}")
@@ -831,6 +921,7 @@ def main() -> int:
                     min_score=min_score,
                     subtraction_radius=args.subtraction_radius,
                     max_iterations=args.max_iterations,
+                    camera_json_path=camera_json_path,
                 )
             except Exception as e:
                 print(f"[!] Error processing BOP scene: {e}")

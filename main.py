@@ -118,9 +118,15 @@ def _add_bop_arguments(
         help="2D isotropic grid downsampling stride (default: 3)",
     )
     parser.add_argument(
-        "--use-roi",
+        "--filter-tabletop",
         action="store_true",
-        help="apply 3D ROI bounding box cropping to strip table and background",
+        help="filter out tabletop plane using RANSAC segmentation",
+    )
+    parser.add_argument(
+        "--ransac-threshold",
+        type=float,
+        default=None,
+        help="distance threshold for RANSAC tabletop removal in meters (defaults to model-specific threshold)",
     )
     _add_run_arguments(parser)
 
@@ -483,8 +489,10 @@ def _load_pipeline(args: argparse.Namespace) -> Any:
         kwargs["depth_range_m"] = args.depth_range_m
     if getattr(args, "depth_stride", None) is not None:
         kwargs["depth_stride"] = args.depth_stride
-    if getattr(args, "use_roi", False):
-        kwargs["use_roi"] = True
+    if getattr(args, "filter_tabletop", False):
+        kwargs["filter_tabletop"] = True
+    if getattr(args, "ransac_threshold", None) is not None:
+        kwargs["ransac_threshold_m"] = args.ransac_threshold
 
     return BOPPipeline(args.bop_manifest, args.model, args.split, **kwargs)
 

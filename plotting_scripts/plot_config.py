@@ -27,26 +27,36 @@ THEME_GREEN = "#548235"      # themegreen
 THEME_ORANGE = "#C68642"     # themeorange
 THEME_RED = "#C0504D"        # themered
 
-# Setup Matplotlib style
-def setup_plt_style():
+# Setup Matplotlib style with thesis scale compensation
+def setup_plt_style(scale: float = 2.0):
+    """Configure matplotlib rcParams.
+
+    Note on thesis scaling:
+      In the LaTeX thesis, figures (typically figsize width 11~14 in) are inserted at width ≈ 0.9~1.0\\textwidth
+      (\\textwidth = 15.6 cm ≈ 6.14 in), which scales the entire figure canvas down by a factor of S ≈ 0.45~0.52.
+      To ensure typography on the printed page adheres to thesis standards:
+        - Titles & Labels: 五号 (10.5 pt) -> matplotlib fontsize ≈ 10.5 * 2.0 = 21.0 pt
+        - Ticks & Legends: 小五号 (9.0~9.5 pt) -> matplotlib fontsize ≈ 9.0~9.5 * 2.0 = 18~19 pt
+      scale defaults to 2.0 to provide 1:1 perceptual match to body / caption typography.
+    """
     matplotlib.rcParams['font.family'] = ['SimSun', 'Times New Roman']
     matplotlib.rcParams['font.sans-serif'] = ['SimSun', 'Microsoft YaHei', 'DejaVu Sans']
     matplotlib.rcParams['font.serif'] = ['Times New Roman', 'SimSun', 'DejaVu Serif']
     matplotlib.rcParams['mathtext.fontset'] = 'stix'
     matplotlib.rcParams['axes.unicode_minus'] = False
-    matplotlib.rcParams['axes.labelsize'] = 10.5
-    matplotlib.rcParams['axes.titlesize'] = 11.5
-    matplotlib.rcParams['xtick.labelsize'] = 9.5
-    matplotlib.rcParams['ytick.labelsize'] = 9.5
-    matplotlib.rcParams['legend.fontsize'] = 9.0
-    matplotlib.rcParams['figure.titlesize'] = 12.0
-    matplotlib.rcParams['lines.linewidth'] = 1.6
-    matplotlib.rcParams['lines.markersize'] = 5.0
+    matplotlib.rcParams['axes.labelsize'] = 10.0 * scale   # 20.0 pt -> ~10.0 pt on page
+    matplotlib.rcParams['axes.titlesize'] = 10.5 * scale   # 21.0 pt -> ~10.5 pt on page (五号)
+    matplotlib.rcParams['xtick.labelsize'] = 9.0 * scale   # 18.0 pt -> ~9.0 pt on page
+    matplotlib.rcParams['ytick.labelsize'] = 9.0 * scale   # 18.0 pt -> ~9.0 pt on page
+    matplotlib.rcParams['legend.fontsize'] = 9.0 * scale   # 18.0 pt -> ~9.0 pt on page
+    matplotlib.rcParams['figure.titlesize'] = 11.5 * scale # 23.0 pt
+    matplotlib.rcParams['lines.linewidth'] = 1.6 * 1.25    # 2.0 pt
+    matplotlib.rcParams['lines.markersize'] = 5.0 * 1.25   # 6.25 pt
     matplotlib.rcParams['grid.linestyle'] = '--'
     matplotlib.rcParams['grid.alpha'] = 0.5
     matplotlib.rcParams['savefig.dpi'] = 300
     matplotlib.rcParams['savefig.bbox'] = 'tight'
-    matplotlib.rcParams['savefig.pad_inches'] = 0.05
+    matplotlib.rcParams['savefig.pad_inches'] = 0.04
 
 def save_fig(fig: plt.Figure, name: str):
     """Save figure as vector PDF and PNG."""

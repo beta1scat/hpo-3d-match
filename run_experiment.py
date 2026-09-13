@@ -142,14 +142,18 @@ def run_single_experiment(
     manifest_path: Path | None = None,
     allow_query_overlap: bool = False,
     resume: bool = False,
-    use_roi: bool | None = None,
+    filter_tabletop: bool | None = None,
+    ransac_threshold: float | None = None,
 ) -> dict[str, Any]:
     """Run full HPO optimization lifecycle for a specified configuration."""
     manifest = manifest_path or (ROOT / "data" / "manifests" / "itodd_scene0_v1" / "bop_manifest.csv")
-    if use_roi is None:
-        use_roi = "itoddmv_val" in str(manifest)
-    if use_roi:
-        print(f"[*] 3D ROI scene preprocessing enabled for {manifest.name}")
+    if filter_tabletop is None:
+        filter_tabletop = (
+            "itoddmv_val" in str(manifest)
+            or "itodd_manual_annotated" in str(manifest)
+        )
+    if filter_tabletop:
+        print(f"[*] RANSAC tabletop removal enabled for {manifest.name}")
 
     obj_tag = "lexrecall" if ("recall" in objective_version or "lex" in objective_version) else "fixedpen"
     exp_dir_name = f"{model}_{sampler.lower()}_{pruner.lower()}_{obj_tag}_b{budget}_s{seed}"
@@ -173,8 +177,10 @@ def run_single_experiment(
         "--model", model,
         "--objective-version", objective_version,
     ]
-    if use_roi:
-        common_opts += ["--use-roi"]
+    if filter_tabletop:
+        common_opts += ["--filter-tabletop"]
+    if ransac_threshold is not None:
+        common_opts += ["--ransac-threshold", str(ransac_threshold)]
     if config_path and config_path.exists():
         common_opts += ["--protocol-record", str(config_path)]
 
@@ -241,7 +247,10 @@ def run_single_experiment(
                 eval_cmd.append("--allow-query-overlap")
             run_phase_subprocess(eval_cmd, logs_dir / f"eval_ckpt_{ckpt}.log", f"Checkpoint {ckpt} Evaluation")
         
-        res = read_json_dict(ckpt_manifest)["result"]
+        manifest_data = read_json_dict(ckpt_manifest)
+        res = manifest_data["result"]
+        source_val = manifest_data.get("source_best_value")
+        source_trial = manifest_data.get("source_trial_number")
         checkpoint_results.append({
             "checkpoint": ckpt,
             "tp": res["tp"],
@@ -249,9 +258,12 @@ def run_single_experiment(
             "fn": res["fn"],
             "f1": res["f1"],
             "objective": res["objective"],
+            "source_objective": source_val,
+            "source_trial": source_trial,
             "method": res["method"],
         })
-        print(f"[*] Checkpoint {ckpt:4d}: TP={res['tp']:2d}, FP={res['fp']:3d}, FN={res['fn']:2d}, F1={res['f1']:.4f}, Loss={res['objective']:.2f}")
+        src_str = f" | Best Trial #{source_trial} TrainLoss={source_val:.2f}" if source_val is not None else ""
+        print(f"[*] Checkpoint {ckpt:4d}: TP={res['tp']:2d}, FP={res['fp']:3d}, FN={res['fn']:2d}, F1={res['f1']:.4f}, EvalLoss={res['objective']:.2f}{src_str}")
 
     summary = {
         "experiment_name": out_root.name,
@@ -261,7 +273,8 @@ def run_single_experiment(
         "objective_version": objective_version,
         "budget": budget,
         "seed": seed,
-        "use_roi": use_roi,
+        "filter_tabletop": filter_tabletop,
+        "ransac_threshold": ransac_threshold,
         "default_baseline": default_result,
         "checkpoints": checkpoint_results,
     }
@@ -302,10 +315,16 @@ def main() -> int:
         help="Explicitly allow evaluation queries to overlap study queries (manual opt-in for Oracle experiments)",
     )
     parser.add_argument(
-        "--use-roi",
+        "--filter-tabletop",
         action="store_true",
         default=None,
-        help="Explicitly enable 3D ROI bounding box cropping (auto-enabled for itoddmv_val)",
+        help="Explicitly enable RANSAC tabletop removal (auto-enabled for itoddmv_val and itodd_manual_annotated)",
+    )
+    parser.add_argument(
+        "--ransac-threshold",
+        type=float,
+        default=None,
+        help="Distance threshold for RANSAC tabletop removal in meters",
     )
     parser.add_argument("--resume", action="store_true")
     parser.add_argument(
@@ -334,7 +353,8 @@ def main() -> int:
                 manifest_path=args.manifest,
                 allow_query_overlap=args.allow_query_overlap,
                 resume=args.resume,
-                use_roi=args.use_roi,
+                filter_tabletop=args.filter_tabletop,
+                ransac_threshold=args.ransac_threshold,
             )
         return 0
 
@@ -352,7 +372,8 @@ def main() -> int:
         manifest_path=args.manifest,
         allow_query_overlap=args.allow_query_overlap,
         resume=args.resume,
-        use_roi=args.use_roi,
+        filter_tabletop=args.filter_tabletop,
+        ransac_threshold=args.ransac_threshold,
     )
     return 0
 

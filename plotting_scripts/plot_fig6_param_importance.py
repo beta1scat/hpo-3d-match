@@ -38,12 +38,12 @@ def main():
     setup_plt_style()
     
     models = [
-        ("bracket_planar", "(a) 薄板零件 (bracket_planar)"),
-        ("screw_black", "(b) 连续对称螺栓 (screw_black)"),
-        ("star", "(c) 离散对称把手 (star)"),
+        ("bracket_planar", "(a) 薄板件"),
+        ("screw_black", "(b) 连续对称螺栓"),
+        ("star", "(c) 离散对称把手"),
     ]
     
-    fig, axes = plt.subplots(1, 3, figsize=(14.0, 4.2), sharey=True)
+    fig, axes = plt.subplots(1, 3, figsize=(14.5, 5.2), sharey=True)
     
     param_labels = {
         "RelSamplingDistance": "空间采样距离 (RelSamplingDistance)",
@@ -74,16 +74,17 @@ def main():
         
         bars = ax.barh(y_pos, vals, color=colors, edgecolor=THEME_BLUE_DARK, height=0.6)
         ax.set_yticks(y_pos)
-        ax.set_yticklabels(labels, fontsize=9.0)
+        ax.set_yticklabels(labels, fontsize=17.0)
         ax.invert_yaxis()  # top-down
-        ax.set_title(title, pad=8)
+        ax.set_title(title, pad=10)
         ax.set_xlabel("参数重要度贡献率 (%)")
+        ax.set_xlim(0, 105)
         ax.grid(True, axis="x", linestyle="--", alpha=0.5)
         
         for bar in bars:
             w = bar.get_width()
             if w > 1.5:
-                ax.text(w + 0.8, bar.get_y() + bar.get_height()/2, f"{w:.1f}%", va="center", fontsize=8.5)
+                ax.text(w + 1.2, bar.get_y() + bar.get_height()/2, f"{w:.1f}%", va="center", fontsize=16.0, fontweight="bold")
     
     plt.tight_layout()
     save_fig(fig, "ch3_fig6_param_importance")

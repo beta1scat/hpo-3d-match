@@ -16,12 +16,12 @@ import optuna
 from bop_scene_loader import (
     backproject_depth,
     create_halcon_point_cloud,
-    filter_points_roi,
+    filter_points_ransac_tabletop,
     read_bop_camera,
     read_bop_ground_truths,
     read_depth_image,
 )
-from config import DEFAULT_PARAMS, ROIConfig, SEARCH_SPACE
+from config import DEFAULT_PARAMS, RANSAC_TABLETOP_THRESHOLDS, SEARCH_SPACE
 from dataset import SPLIT_NAMES, TARGET_OBJECT_IDS
 from evaluation import PoseRecord, SymmetryConfig, read_bop_symmetry
 from experiment_io import append_jsonl, generate_run_id
@@ -361,8 +361,8 @@ class BOPPipeline:
         model_scale: str | float = MODEL_SCALE_MM_TO_M,
         depth_range_m: Sequence[float] | None = DEFAULT_DEPTH_RANGE_M,
         depth_stride: int = DEFAULT_DEPTH_STRIDE,
-        use_roi: bool = False,
-        roi: ROIConfig | None = None,
+        filter_tabletop: bool = False,
+        ransac_threshold_m: float | None = None,
     ) -> None:
         self.manifest_path = Path(manifest_path).expanduser().resolve()
         self.model_name = model_name
@@ -370,8 +370,13 @@ class BOPPipeline:
         self.model_scale = model_scale
         self.depth_range_m = depth_range_m
         self.depth_stride = depth_stride
-        self.use_roi = bool(use_roi)
-        self.roi = roi if roi is not None else ROIConfig()
+        self.filter_tabletop = bool(filter_tabletop)
+        if ransac_threshold_m is not None:
+            self.ransac_threshold_m = float(ransac_threshold_m)
+        else:
+            self.ransac_threshold_m = RANSAC_TABLETOP_THRESHOLDS.get(
+                model_name, 0.0020
+            )
         self.queries = read_bop_queries(self.manifest_path, model_name, split)
         self.model_point_cloud = None
         self.cached_queries: tuple[CachedBOPQuery, ...] = ()
@@ -408,17 +413,30 @@ class BOPPipeline:
                     )
                 symmetry = read_bop_symmetry(query.models_info_path, query.obj_id)
                 preprocessing_start = perf_counter()
-                camera = read_bop_camera(query.scene_camera_path, query.image_id)
-                points_xyz_m = backproject_depth(
-                    read_depth_image(query.depth_path),
-                    camera,
-                    depth_range_m=self.depth_range_m,
-                    stride=self.depth_stride,
+                depth_p = Path(query.depth_path).expanduser().resolve()
+                cached_ply = (
+                    depth_p.parent.parent
+                    / "points_tabletop_filtered"
+                    / f"{query.image_id:06d}_filtered.ply"
                 )
-                if self.use_roi:
-                    points_xyz_m = filter_points_roi(
-                        points_xyz_m, self.roi
+                if self.filter_tabletop and cached_ply.is_file():
+                    import open3d as o3d
+
+                    pcd = o3d.io.read_point_cloud(str(cached_ply))
+                    points_xyz_m = np.asarray(pcd.points, dtype=np.float64)
+                else:
+                    camera = read_bop_camera(query.scene_camera_path, query.image_id)
+                    points_xyz_m = backproject_depth(
+                        read_depth_image(query.depth_path),
+                        camera,
+                        depth_range_m=self.depth_range_m,
+                        stride=self.depth_stride,
                     )
+                    if self.filter_tabletop:
+                        points_xyz_m = filter_points_ransac_tabletop(
+                            points_xyz_m,
+                            distance_threshold_m=self.ransac_threshold_m,
+                        )
                 pending_scene_handle = create_halcon_point_cloud(points_xyz_m)
                 scene_handles.append(pending_scene_handle)
                 scene_point_cloud = pending_scene_handle
@@ -435,6 +453,31 @@ class BOPPipeline:
                     )
                 )
             self.cached_queries = tuple(cached)
+            if self.filter_tabletop:
+                cached_ply_count = sum(
+                    1
+                    for q in self.queries
+                    if (
+                        Path(q.depth_path).expanduser().resolve().parent.parent
+                        / "points_tabletop_filtered"
+                        / f"{q.image_id:06d}_filtered.ply"
+                    ).is_file()
+                )
+                if cached_ply_count == len(self.queries):
+                    print(
+                        f"[*] BOPPipeline: Loaded all {cached_ply_count} scenes directly from "
+                        f"cached points_tabletop_filtered/ (.ply)"
+                    )
+                elif cached_ply_count > 0:
+                    print(
+                        f"[*] BOPPipeline: Loaded {cached_ply_count}/{len(self.queries)} scenes from "
+                        f"cached .ply (remaining used fallback dynamic RANSAC)"
+                    )
+                else:
+                    print(
+                        f"[*] BOPPipeline: No cached .ply found in points_tabletop_filtered/; "
+                        f"used fallback dynamic RANSAC"
+                    )
         except BaseException:
             _clear_object_models(
                 scene_handles + [pending_scene_handle, self.model_point_cloud],
